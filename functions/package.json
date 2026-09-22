@@ -1,0 +1,14 @@
+{
+  "name": "functions",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "@google-cloud/speech": "^6.7.0",
+    "firebase-admin": "^12.3.1",
+    "firebase-functions": "^5.0.1",
+    "node-fetch": "^2.7.0"
+  },
+  "private": true
+}
