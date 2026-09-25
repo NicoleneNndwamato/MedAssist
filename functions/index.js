@@ -1,123 +1,216 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
-const speech = require("@google-cloud/speech");
-const fetch = require("node-fetch");
+const admin = require("firebase-admin");
 
-const anthropicApiKey = defineSecret("ANTHROPIC_API_KEY");
+admin.initializeApp();
 
-const speechClient = new speech.SpeechClient();
+const { QUESTIONS, nextUnansweredQuestion } = require("./services/intakeQuestions");
+const { CANDIDATE_LANGUAGES } = require("./config/languages");
+const { identifyLanguageAndTranscribe, transcribe, synthesizeSpeech } = require("./services/azureSpeech");
+const { translateText, translateToEnglish } = require("./services/azureTranslate");
+const {
+  getPatientByPhone,
+  createPatientIfMissing,
+  upsertPatientProfile,
+  addHistoryEntry
+} = require("./services/patientRepository");
 
-const SYSTEM_PROMPT = `You are the voice assistant for MedAssist, an appointment triage app used mainly by elderly patients and others who would otherwise wait hours to be seen at a hospital or clinic.
-
-Your job in this conversation:
-1. Ask natural, conversational follow-up questions to understand what is going on. Cover, over the course of the conversation, at minimum: whether the person is fully alert and responsive, whether they are having severe difficulty breathing, whether there is chest pain or pressure, whether there is heavy uncontrolled bleeding, how severe any pain is on a 1-10 scale, and how long this has been going on. You do not need to ask these as a rigid checklist - weave them naturally into the conversation based on what the person tells you, and skip a question if they've already answered it in an earlier message.
-2. You NEVER diagnose a condition. Do not name or guess at illnesses. You only classify urgency.
-3. If the person reports any of: unresponsiveness/severe drowsiness, severe difficulty breathing, chest pain or pressure, or heavy uncontrolled bleeding, immediately stop asking further questions and classify priority as IMMEDIATE. Your spokenReply for an IMMEDIATE case must tell them to call emergency services now, and give only these safe waiting instructions: keep the person calm, do not give food or water, stay with them until help arrives. Do not give any other medical advice for an IMMEDIATE case.
-4. For all other cases, once you have enough information (roughly: pain severity and duration, at minimum), classify priority as one of VERY_URGENT, URGENT, STANDARD, or NON_URGENT based on severity and duration, and set triageComplete to true.
-5. For non-IMMEDIATE cases, your final spokenReply's guidance should be limited to generic comfort measures (rest, a comfortable seated or lying position, monitoring for changes) and a clear instruction to seek emergency care immediately if anything worsens suddenly.
-6. ALWAYS reply in the same language the person is speaking to you in. If they switch languages mid-conversation, switch with them.
-7. Keep spokenReply short and natural, like something a calm, kind person would actually say out loud in a phone call - not a list, not clinical jargon.
-
-You must respond with ONLY a JSON object and nothing else - no preamble, no markdown code fences, no explanation. The JSON object must have exactly these fields:
-{
-  "spokenReply": "string, what you say out loud next",
-  "triageComplete": boolean,
-  "priority": "IMMEDIATE" | "VERY_URGENT" | "URGENT" | "STANDARD" | "NON_URGENT" | null,
-  "guidance": "string or null, only filled in once triageComplete is true",
-  "symptomsSummary": "string or null, a short factual summary of what the person reported, only filled in once triageComplete is true"
+// Loaded from functions/.env at deploy/emulator time (see functions/.env.example).
+function azureCreds() {
+  return {
+    speechKey: process.env.AZURE_SPEECH_KEY,
+    speechRegion: process.env.AZURE_SPEECH_REGION,
+    translatorKey: process.env.AZURE_TRANSLATOR_KEY,
+    translatorRegion: process.env.AZURE_TRANSLATOR_REGION,
+    translatorEndpoint: process.env.AZURE_TRANSLATOR_ENDPOINT || "https://api.cognitive.microsofttranslator.com"
+  };
 }
 
-If triageComplete is false, priority, guidance, and symptomsSummary should all be null.`;
-
-const LANGUAGE_CODES = ["en-ZA", "af-ZA", "zu-ZA", "xh-ZA", "st-ZA"];
-
-exports.voiceTurn = onCall({ secrets: [anthropicApiKey] }, async (request) => {
-  const { audioBase64, conversationHistory } = request.data || {};
-
-  if (!audioBase64) {
-    throw new HttpsError("invalid-argument", "audioBase64 is required");
-  }
-
-  const [sttResponse] = await speechClient.recognize({
-    config: {
-      encoding: "MP3",
-      sampleRateHertz: 44100,
-      languageCode: LANGUAGE_CODES[0],
-      alternativeLanguageCodes: LANGUAGE_CODES.slice(1)
-    },
-    audio: { content: audioBase64 }
+// Builds the "next question, already translated and already spoken aloud"
+// payload the client needs: text in the patient's language plus ready-to-play
+// MP3 audio. Returns null once there's nothing left to ask.
+async function buildQuestionPayload(question, languageCode) {
+  if (!question) return null;
+  const creds = azureCreds();
+  const translatedText = await translateText({ text: question.text, toLanguageCode: languageCode, ...creds });
+  const audioBuffer = await synthesizeSpeech({
+    text: translatedText,
+    languageCode,
+    speechKey: creds.speechKey,
+    speechRegion: creds.speechRegion
   });
+  return { id: question.id, text: translatedText, audioBase64: audioBuffer.toString("base64") };
+}
 
-  const transcript = (sttResponse.results || [])
-    .map((r) => r.alternatives[0].transcript)
-    .join(" ")
-    .trim();
+async function speakInLanguage(text, languageCode) {
+  const creds = azureCreds();
+  const translated = await translateText({ text, toLanguageCode: languageCode, ...creds });
+  const audioBuffer = await synthesizeSpeech({
+    text: translated,
+    languageCode,
+    speechKey: creds.speechKey,
+    speechRegion: creds.speechRegion
+  });
+  return { text: translated, audioBase64: audioBuffer.toString("base64") };
+}
 
-  const detectedLanguage =
-    (sttResponse.results && sttResponse.results[0] && sttResponse.results[0].languageCode) ||
-    LANGUAGE_CODES[0];
+// ---------------------------------------------------------------------------
+// Multilingual phone intake (Azure Speech + Azure Translator).
+// This is deliberately a separate, deterministic script-driven pipeline,
+// NOT another AI conversation loop - it's the "listen -> figure out the
+// language -> ask the fixed set of intake questions -> talk back" flow,
+// built so the exact same functions can sit behind USSD/telephony later.
+// ---------------------------------------------------------------------------
 
-  if (!transcript) {
+// Called the instant the patient "dials in". Looks them up by phone number.
+//
+// Returning patient: we already know their language and their name/age/
+// provider, so we skip straight to whatever's left to ask (their symptoms
+// for THIS call). Real telephony would hand us their language from the
+// network; for the hackathon we simulate that lookup delay with hold music
+// on the client while this call is in flight.
+//
+// New patient: we don't know their language yet, so we return one greeting
+// per candidate language for the client to play back-to-back, then start
+// listening - whichever one they answer in tells us their language.
+exports.startCall = onCall(async (request) => {
+  const { phoneNumber } = request.data || {};
+  if (!phoneNumber) throw new HttpsError("invalid-argument", "phoneNumber is required");
+
+  const existing = await getPatientByPhone(phoneNumber);
+
+  if (existing && existing.preferredLanguage) {
+    const question = nextUnansweredQuestion(existing, []);
+    const questionPayload = await buildQuestionPayload(question, existing.preferredLanguage);
+    const greeting = await speakInLanguage(
+      `Welcome back${existing.name ? ", " + existing.name : ""}. Let's talk about how you're feeling today.`,
+      existing.preferredLanguage
+    );
+
     return {
-      transcript: "",
-      languageCode: detectedLanguage,
-      spokenReply: "Sorry, I didn't catch that. Could you say that again?",
-      triageComplete: false,
-      priority: null,
-      guidance: null,
-      symptomsSummary: null
+      isNewPatient: false,
+      language: existing.preferredLanguage,
+      profile: existing,
+      greeting,
+      question: questionPayload
     };
   }
 
-  const history = Array.isArray(conversationHistory) ? conversationHistory : [];
-  const messages = [...history, { role: "user", content: transcript }];
-
-  const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": anthropicApiKey.value(),
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 500,
-      system: SYSTEM_PROMPT,
-      messages
+  const prompts = await Promise.all(
+    CANDIDATE_LANGUAGES.map(async (lang) => {
+      const spoken = await speakInLanguage("Welcome to MedAssist. Please tell us your name to begin.", lang);
+      return { language: lang, ...spoken };
     })
+  );
+
+  return { isNewPatient: true, prompts };
+});
+
+// A brand-new patient's very first reply. We don't know their language yet,
+// so we transcribe this one clip against every candidate language and trust
+// whichever one Azure was most confident about. That same clip doubles as
+// the answer to the first question (name), so detecting the language costs
+// us nothing extra.
+exports.submitLanguageSample = onCall(async (request) => {
+  const { phoneNumber, audioBase64, mimeType } = request.data || {};
+  if (!phoneNumber || !audioBase64) {
+    throw new HttpsError("invalid-argument", "phoneNumber and audioBase64 are required");
+  }
+
+  const creds = azureCreds();
+  const audioBuffer = Buffer.from(audioBase64, "base64");
+  const result = await identifyLanguageAndTranscribe({
+    audioBuffer,
+    mimeType: mimeType || "audio/wav; codecs=audio/pcm; samplerate=16000",
+    speechKey: creds.speechKey,
+    speechRegion: creds.speechRegion
   });
 
-  if (!anthropicResponse.ok) {
-    const errText = await anthropicResponse.text();
-    throw new HttpsError("internal", `Anthropic API error: ${errText}`);
+  await createPatientIfMissing(phoneNumber);
+  await upsertPatientProfile(phoneNumber, { preferredLanguage: result.locale });
+
+  const nameQuestion = QUESTIONS[0]; // "What is your name?" - always first
+  const englishAnswer = await translateToEnglish({ text: result.transcript, fromLanguageCode: result.locale, ...creds });
+  if (englishAnswer) {
+    await upsertPatientProfile(phoneNumber, { [nameQuestion.field]: englishAnswer });
   }
 
-  const data = await anthropicResponse.json();
-  const rawText = (data.content || [])
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
-
-  let parsed;
-  try {
-    parsed = JSON.parse(rawText.replace(/```json|```/g, "").trim());
-  } catch (err) {
-    parsed = {
-      spokenReply: "Sorry, could you say that again?",
-      triageComplete: false,
-      priority: null,
-      guidance: null,
-      symptomsSummary: null
-    };
-  }
+  const updatedProfile = await getPatientByPhone(phoneNumber);
+  const nextQuestion = nextUnansweredQuestion(updatedProfile, [nameQuestion.id]);
+  const questionPayload = await buildQuestionPayload(nextQuestion, result.locale);
 
   return {
-    transcript,
-    languageCode: detectedLanguage,
-    spokenReply: parsed.spokenReply,
-    triageComplete: !!parsed.triageComplete,
-    priority: parsed.priority || null,
-    guidance: parsed.guidance || null,
-    symptomsSummary: parsed.symptomsSummary || null
+    detectedLanguage: result.locale,
+    heard: { local: result.transcript, english: englishAnswer },
+    isDone: !nextQuestion,
+    question: questionPayload
   };
+});
+
+// The core "listen -> transcribe -> translate -> talk back" turn, reused for
+// every remaining question in the script. `answeredIds` is every question
+// id already answered THIS call (not counting this one) so we know what's
+// left. Same shape this will use once it moves behind USSD/telephony.
+exports.answerQuestion = onCall(async (request) => {
+  const { phoneNumber, questionId, audioBase64, mimeType, language, answeredIds } = request.data || {};
+  if (!phoneNumber || !questionId || !audioBase64 || !language) {
+    throw new HttpsError("invalid-argument", "phoneNumber, questionId, audioBase64 and language are required");
+  }
+
+  const creds = azureCreds();
+  const audioBuffer = Buffer.from(audioBase64, "base64");
+  const { transcript } = await transcribe({
+    audioBuffer,
+    mimeType: mimeType || "audio/wav; codecs=audio/pcm; samplerate=16000",
+    locale: language,
+    speechKey: creds.speechKey,
+    speechRegion: creds.speechRegion
+  });
+  const englishAnswer = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
+
+  const question = QUESTIONS.find((q) => q.id === questionId);
+  if (question && question.profileField) {
+    await upsertPatientProfile(phoneNumber, { [question.field]: englishAnswer });
+  }
+
+  const profile = await getPatientByPhone(phoneNumber);
+  const fullyAnswered = [...(Array.isArray(answeredIds) ? answeredIds : []), questionId];
+  const nextQuestion = nextUnansweredQuestion(profile, fullyAnswered);
+  const questionPayload = await buildQuestionPayload(nextQuestion, language);
+
+  return {
+    questionId,
+    heard: { local: transcript, english: englishAnswer },
+    isDone: !nextQuestion,
+    question: questionPayload
+  };
+});
+
+// Called once every question has been answered. Saves everything collected
+// during THIS call as one entry in patients/{phoneNumber}/history, so a
+// doctor can see every past call for this patient, not just the latest one.
+exports.completeIntake = onCall(async (request) => {
+  const { phoneNumber, language, answers } = request.data || {};
+  if (!phoneNumber || !answers) {
+    throw new HttpsError("invalid-argument", "phoneNumber and answers are required");
+  }
+
+  const ambulanceText = (answers.needsAmbulance || "").toLowerCase();
+  const needsAmbulanceFlag =
+    ambulanceText.includes("yes") || ambulanceText.includes("ja") || ambulanceText.includes("yebo");
+
+  const historyId = await addHistoryEntry(phoneNumber, {
+    language: language || null,
+    location: answers.location || null,
+    symptoms: answers.symptoms || null,
+    symptomDuration: answers.symptomDuration || null,
+    lastVisit: answers.lastVisit || null,
+    medicalHistory: answers.medicalHistory || null,
+    medications: answers.medications || null,
+    needsAmbulance: answers.needsAmbulance || null,
+    needsAmbulanceFlag,
+    emergencyContactNumber: answers.emergencyContactNumber || null,
+    rawAnswers: answers.rawAnswers || []
+  });
+
+  return { historyId };
 });
