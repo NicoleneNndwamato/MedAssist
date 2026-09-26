@@ -10,7 +10,6 @@ import {
   createAudioPlayer
 } from "expo-audio";
 import { startCall, submitLanguageSample, answerQuestion, completeIntake } from "../services/callService";
-
 // The number this hackathon build always "dials" - a real USSD/telephony
 // integration would get this from the network instead of a hardcoded value.
 const DEMO_PHONE_NUMBER = "1234567890";
@@ -42,29 +41,93 @@ const AZURE_CONTENT_TYPE = "audio/wav; codecs=audio/pcm; samplerate=16000";
 // (e.g. three greetings back-to-back) with plain async/await.
 async function playAndWait(source) {
   return new Promise((resolve, reject) => {
-    let player;
+    let player = null;
+    let subscription = null;
+    let finished = false;
+
+    const cleanup = () => {
+      try {
+        subscription?.remove();
+      } catch (err) {
+        console.warn("Could not remove playback listener:", err);
+      }
+
+      try {
+        player?.release();
+      } catch (err) {
+        console.warn("Could not release audio player:", err);
+      }
+    };
+
     try {
       player = createAudioPlayer(source);
+
+      subscription = player.addListener(
+        "playbackStatusUpdate",
+        (status) => {
+          if (status.didJustFinish && !finished) {
+            finished = true;
+            cleanup();
+            resolve();
+          }
+        }
+      );
+
+      player.play();
     } catch (err) {
-      reject(err);
-      return;
-    }
-    const subscription = player.addListener("playbackStatusUpdate", (status) => {
-      if (status.didJustFinish) {
-        subscription.remove();
-        player.remove();
-        resolve();
+      if (!finished) {
+        finished = true;
+        cleanup();
+        reject(err);
       }
-    });
-    player.play();
+    }
   });
 }
 
 async function playBase64Mp3(base64) {
-  const file = new File(Paths.cache, `medassist-tts-${Date.now()}.mp3`);
-  file.write(base64, { encoding: "base64" });
-  await playAndWait({ uri: file.uri });
-  file.delete();
+  if (!base64) {
+    throw new Error("No TTS audio was returned by MedAssist.");
+  }
+
+  const file = new File(
+    Paths.cache,
+    `medassist-tts-${Date.now()}.mp3`
+  );
+
+  try {
+    // Convert the base64 returned by Azure into actual MP3 bytes.
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+
+    for (let i = 0; i < binaryString.length; i += 1) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    file.write(bytes);
+
+    console.log(
+      "MedAssist TTS file created:",
+      file.uri,
+      "bytes:",
+      bytes.length
+    );
+
+    await playAndWait({ uri: file.uri });
+  } catch (err) {
+    console.error("MedAssist TTS playback failed:", err);
+    throw err;
+  } finally {
+    try {
+      if (file.exists) {
+        file.delete();
+      }
+    } catch (cleanupError) {
+      console.warn(
+        "Could not delete temporary TTS file:",
+        cleanupError
+      );
+    }
+  }
 }
 
 export default function CallScreen({ onIntakeComplete }) {
@@ -102,12 +165,17 @@ export default function CallScreen({ onIntakeComplete }) {
     holdMusicPlayerRef.current = player;
   }
 
-  function stopHoldMusic() {
-    if (holdMusicPlayerRef.current) {
-      holdMusicPlayerRef.current.remove();
-      holdMusicPlayerRef.current = null;
+ function stopHoldMusic() {
+  if (holdMusicPlayerRef.current) {
+    try {
+      holdMusicPlayerRef.current.release();
+    } catch (err) {
+      console.warn("Could not release hold music:", err);
     }
+
+    holdMusicPlayerRef.current = null;
   }
+}
 
   function logLine(role, text) {
     setTranscriptLog((prev) => [...prev, { role, text }]);

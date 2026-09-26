@@ -12,7 +12,8 @@
           "microphonePermission": "Allow MedAssist to access your microphone so you can talk to the assistant.",
           "recordAudioAndroid": true
         }
-      ]
+      ],
+      "expo-asset"
     ],
     "android": {
       "package": "com.medassist.app"
