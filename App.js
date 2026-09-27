@@ -1,8 +1,7 @@
 import React, { useState } from "react";
 import { SafeAreaView, StyleSheet } from "react-native";
-import { StatusBar } from "expo-status-bar";
+//import { StatusBar } from "expo-status-bar";
 
-import CallScreen from "./src/screens/CallScreen";
 import ConversationScreen from "./src/screens/ConversationScreen";
 import PriorityResultScreen from "./src/screens/PriorityResultScreen";
 import BookingScreen from "./src/screens/BookingScreen";
@@ -12,22 +11,12 @@ import { PRIORITY_LABELS, PRIORITY_WEIGHTS } from "./src/data/priority";
 import { getFacilities, createAppointment, notifyFacility } from "./src/data/firestoreRepository";
 
 export default function App() {
-  // "call" is the new multilingual phone-style intake (name, age, symptoms,
-  // etc). Once that's done we hand off into the existing free-form Gemini
-  // conversation for deeper follow-up, then the existing result/booking flow.
-  const [phase, setPhase] = useState("call");
+  const [phase, setPhase] = useState("conversation");
   const [triageResult, setTriageResult] = useState(null);
   const [facilities, setFacilities] = useState([]);
   const [selectedFacility, setSelectedFacility] = useState(null);
   const [patientName, setPatientName] = useState("");
   const [patientPhone, setPatientPhone] = useState("");
-
-  function handleIntakeComplete(intakeData) {
-    const profile = intakeData.profile || {};
-    if (profile.name) setPatientName([profile.name, profile.surname].filter(Boolean).join(" "));
-    setPatientPhone(intakeData.phoneNumber || "");
-    setPhase("conversation");
-  }
 
   async function handleTriageComplete(result) {
     setTriageResult(result);
@@ -66,7 +55,7 @@ export default function App() {
   }
 
   function handleReset() {
-    setPhase("call");
+    setPhase("conversation");
     setTriageResult(null);
     setFacilities([]);
     setSelectedFacility(null);
@@ -76,9 +65,7 @@ export default function App() {
 
   let screen = null;
 
-  if (phase === "call") {
-    screen = <CallScreen onIntakeComplete={handleIntakeComplete} />;
-  } else if (phase === "conversation") {
+  if (phase === "conversation") {
     screen = <ConversationScreen onTriageComplete={handleTriageComplete} />;
   } else if (phase === "result" && triageResult) {
     screen = (

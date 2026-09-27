@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator } from "react-native";
-import * as Speech from "expo-speech";
+//import * as Speech from "expo-speech";
 import { File } from "expo-file-system";
 import { AudioModule, RecordingPresets, useAudioRecorder, useAudioRecorderState, setAudioModeAsync } from "expo-audio";
 import { sendVoiceTurn } from "../services/geminiService";
