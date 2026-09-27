@@ -1,0 +1,13 @@
+{
+  "name": "functions",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^12.3.1",
+    "firebase-functions": "^5.0.1",
+    "node-fetch": "^2.7.0"
+  },
+  "private": true
+}
