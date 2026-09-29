@@ -5,12 +5,13 @@ const { playAndRecord, playAndHangup, sayAndHangup } = require("./services/voice
 
 admin.initializeApp({ storageBucket: "medassist-397be.firebasestorage.app" });
 
-const { QUESTIONS, nextUnansweredQuestion } = require("./services/intakeQuestions");
+const { QUESTIONS } = require("./services/intakeQuestions");
 const { CANDIDATE_LANGUAGES } = require("./config/languages");
 const { identifyLanguageAndTranscribe, transcribe } = require("./services/azureSpeech");
-const { translateToEnglish } = require("./services/azureTranslate");
+const { translateToEnglish, translateText } = require("./services/azureTranslate");
 const { getSpokenAudioUrl } = require("./services/ttsCache");
 const { saveAudioClip } = require("./services/audioStorage");
+const { converse } = require("./services/medAssistAgent");
 const {
   getPatientByPhone,
   createPatientIfMissing,
@@ -19,10 +20,23 @@ const {
 } = require("./services/patientRepository");
 const { createSession, getSession, updateSession } = require("./services/callSessions");
 
-// How long a pause tells SignalWire the caller is done talking - the platform's own
-// <Record> feature, no custom silence-detection code needed on our side.
-const RECORD_SILENCE_TIMEOUT_SECONDS = 3;
+// The topics MedAssist's agent needs to cover, in patient-facing wording.
+// This is the single source of truth for both the agent's system prompt
+// and (indirectly, via the same file) anyone reading the code to see what
+// gets asked - QUESTIONS.text is written for exactly this purpose.
+const TOPICS = QUESTIONS.map((q) => q.text);
+
+// How long a pause tells SignalWire the caller is done talking - the
+// platform's own <Record> feature, no custom silence-detection code needed.
+// Also applies BEFORE the caller starts speaking, so give people a moment.
+const RECORD_SILENCE_TIMEOUT_SECONDS = 5;
 const RECORD_MAX_LENGTH_SECONDS = 45;
+
+// How many times we re-ask before giving up and ending the call politely.
+const MAX_REPROMPTS = 2;
+
+const WELCOME_PROMPT = "Welcome to MedAssist. Please tell us your name to begin.";
+const EMPTY_RESPONSE_XML = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
 
 // Loaded from functions/.env at deploy/emulator time (see functions/.env.example).
 function azureCreds() {
@@ -39,27 +53,54 @@ function functionUrl(name) {
   return `${process.env.FUNCTIONS_BASE_URL}/${name}`;
 }
 
-// SignalWire's docs note recordings "are not always available immediately -
-// especially at high call volumes" - so we retry a few times with a short
-// delay rather than failing the whole call on the first blip.
-async function fetchRecordingWithRetry(recordingUrl, { attempts = 4, delayMs = 700 } = {}) {
+// Only fields the agent may have filled in that belong on the PERMANENT
+// patient profile (not just this call) - everything else in its summary is
+// call-specific and goes into the history entry instead.
+const PROFILE_FIELDS = ["name", "surname", "age", "provider"];
+
+function profileUpdatesFrom(summary) {
+  const updates = {};
+  PROFILE_FIELDS.forEach((key) => {
+    if (summary && summary[key]) updates[key] = summary[key];
+  });
+  return updates;
+}
+
+// We don't yet know for certain how SignalWire wants this recording URL
+// fetched - files.signalwire.com doesn't follow the Twilio-style
+// Accounts/.../Recordings/{sid}.wav pattern we first assumed - so this
+// tries several plausible combinations (with/without a .wav suffix,
+// with/without Basic Auth) and reports back exactly which status codes
+// came back for each.
+async function fetchRecordingBuffer(recordingUrl) {
   const authHeader =
     "Basic " +
     Buffer.from(`${process.env.SIGNALWIRE_PROJECT_ID}:${process.env.SIGNALWIRE_API_TOKEN}`).toString("base64");
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    // eslint-disable-next-line no-await-in-loop
-    const response = await fetch(`${recordingUrl}.wav`, { headers: { Authorization: authHeader } });
-    if (response.ok) {
+  const candidates = [
+    { label: "raw, no auth", url: recordingUrl, headers: {} },
+    { label: "raw, basic auth", url: recordingUrl, headers: { Authorization: authHeader } },
+    { label: ".wav, no auth", url: `${recordingUrl}.wav`, headers: {} },
+    { label: ".wav, basic auth", url: `${recordingUrl}.wav`, headers: { Authorization: authHeader } }
+  ];
+
+  const attemptsLog = [];
+  for (let round = 1; round <= 2; round++) {
+    for (const candidate of candidates) {
       // eslint-disable-next-line no-await-in-loop
-      return response.buffer();
+      const response = await fetch(candidate.url, { headers: candidate.headers });
+      if (response.ok) {
+        // eslint-disable-next-line no-await-in-loop
+        return response.buffer();
+      }
+      attemptsLog.push(`${candidate.label}=${response.status}`);
     }
-    if (attempt < attempts) {
+    if (round < 2) {
       // eslint-disable-next-line no-await-in-loop
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await new Promise((resolve) => setTimeout(resolve, 700));
     }
   }
-  throw new Error(`Could not download call recording after ${attempts} attempts: ${recordingUrl}`);
+  throw new Error(`Could not download recording. Tried: ${attemptsLog.join(", ")}`);
 }
 
 function respondWithQuestion(res, audioUrls) {
@@ -75,23 +116,57 @@ function respondAndHangup(res, audioUrls) {
   res.type("text/xml").send(playAndHangup(audioUrls));
 }
 
+// TEMPORARY DEBUG BEHAVIOR: speaks the real error text on the call itself so
+// it can be heard directly without needing dashboard log access. Remove the
+// err.message part once things are stable - real callers should just hear a
+// plain apology.
 function respondWithApology(res, err) {
-  // TEMPORARY DEBUG BEHAVIOR: speak the real error back on the call itself so
-  // it's audible without needing Firebase Console log access. Remove the
-  // err-reading branch below once things are working end-to-end.
-  const message = err
-    ? `Debug error. ${String(err && err.message ? err.message : err).slice(0, 200)}`
-    : "Sorry, something went wrong. Please try calling again.";
-  res.type("text/xml").send(sayAndHangup(message));
+  const detail = err && err.message ? ` Debug detail: ${err.message}` : "";
+  res.type("text/xml").send(sayAndHangup(`Sorry, something went wrong.${detail}`));
+}
+
+// Used when SignalWire sends a callback with no recording (it heard
+// silence) or the recording transcribes to nothing. Re-asks (by replaying
+// the agent's own last message) up to MAX_REPROMPTS times, then ends the
+// call politely rather than hanging up on the first blip.
+async function repromptOrEnd(res, callSid, session, creds) {
+  const retries = session.retries || 0;
+
+  if (retries >= MAX_REPROMPTS) {
+    if (session.language) {
+      const bye = await getSpokenAudioUrl({
+        text: "Sorry, we could not hear you. Please call again when you are ready. Goodbye.",
+        languageCode: session.language,
+        creds
+      });
+      return respondAndHangup(res, [bye.url]);
+    }
+    return res.type("text/xml").send(sayAndHangup("Sorry, we could not hear you. Please call again."));
+  }
+
+  await updateSession(callSid, { retries: retries + 1 });
+
+  if (session.awaitingLanguageDetection || !session.language) {
+    const prompts = await Promise.all(
+      CANDIDATE_LANGUAGES.map((lang) => getSpokenAudioUrl({ text: WELCOME_PROMPT, languageCode: lang, creds }))
+    );
+    return respondWithQuestion(res, prompts.map((p) => p.url));
+  }
+
+  const lastMedassistTurn = [...(session.transcript || [])].reverse().find((t) => t.role === "medassist");
+  const lastReplyText = lastMedassistTurn ? lastMedassistTurn.english : "Could you tell us how you're feeling today?";
+
+  const sorry = await getSpokenAudioUrl({ text: "Sorry, I did not catch that.", languageCode: session.language, creds });
+  const repeat = await getSpokenAudioUrl({ text: lastReplyText, languageCode: session.language, creds });
+  return respondWithQuestion(res, [sorry.url, repeat.url]);
 }
 
 // ---------------------------------------------------------------------------
 // Multilingual phone intake, live on an actual phone number via SignalWire.
-// Two webhooks: SignalWire hits incomingCall the instant someone dials in, then
-// hits handleRecording every time a <Record> finishes (silence detected,
-// max length reached, or the caller hangs up). Everything in between -
-// listen, figure out the language, ask the fixed set of questions, talk
-// back - reuses the exact same Azure services as before.
+// Two webhooks: SignalWire hits incomingCall the instant someone dials in,
+// then hits handleRecording every time a <Record> finishes. Every turn -
+// after the very first, language-detecting one - is driven by MedAssist's
+// Gemini-powered agent (services/medAssistAgent.js), not a fixed script.
 // ---------------------------------------------------------------------------
 
 exports.incomingCall = onRequest(async (req, res) => {
@@ -99,67 +174,61 @@ exports.incomingCall = onRequest(async (req, res) => {
     const phoneNumber = req.body.From;
     const callSid = req.body.CallSid;
     const creds = azureCreds();
+    const geminiApiKey = process.env.GEMINI_API_KEY;
 
     if (!phoneNumber || !callSid) {
       return respondWithApology(res);
     }
 
     const existing = await getPatientByPhone(phoneNumber);
+    const knownProfile = existing
+      ? { name: existing.name, surname: existing.surname, age: existing.age, provider: existing.provider }
+      : {};
 
     if (existing && existing.preferredLanguage) {
-      const question = nextUnansweredQuestion(existing, []);
+      const language = existing.preferredLanguage;
+      const kickoff = existing.name
+        ? `(Call started. The patient is ${existing.name}, calling again. Greet them warmly by name and begin.)`
+        : "(Call started. Greet the patient warmly and begin.)";
+
+      const agentTurn = await converse({
+        history: [],
+        patientMessage: kickoff,
+        knownProfile,
+        topics: TOPICS,
+        apiKey: geminiApiKey
+      });
 
       await createSession(callSid, {
         phoneNumber,
-        language: existing.preferredLanguage,
-        answeredIds: [],
-        answers: {},
-        rawAnswers: [],
-        currentQuestionId: question ? question.id : null,
-        awaitingLanguageDetection: false
+        language,
+        awaitingLanguageDetection: false,
+        conversationHistory: agentTurn.history,
+        summary: agentTurn.summary,
+        transcript: [{ role: "medassist", english: agentTurn.reply, local: null }],
+        retries: 0
       });
 
-      if (!question) {
-        const bye = await getSpokenAudioUrl({
-          text: "Thank you for calling MedAssist. Goodbye.",
-          languageCode: existing.preferredLanguage,
-          creds
-        });
-        return respondAndHangup(res, [bye.url]);
-      }
-
-      const greeting = await getSpokenAudioUrl({
-        text: `Welcome back${existing.name ? ", " + existing.name : ""}. Let's talk about how you're feeling today.`,
-        languageCode: existing.preferredLanguage,
-        creds
-      });
-      const questionAudio = await getSpokenAudioUrl({
-        text: question.text,
-        languageCode: existing.preferredLanguage,
-        creds
-      });
-
-      return respondWithQuestion(res, [greeting.url, questionAudio.url]);
+      const replyAudio = await getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
+      return respondWithQuestion(res, [replyAudio.url]);
     }
 
-    // New caller - we don't know their language yet. Play the same "please
-    // tell us your name" prompt in every candidate language back to back;
-    // whichever one they answer in tells us which language they speak, and
-    // that same recording doubles as their answer to the first question.
+    // New caller, or we don't yet know their language - same "play the
+    // welcome in every candidate language, whichever one they answer in
+    // tells us the language" trick as before. That first reply becomes the
+    // agent's first patient message once we've transcribed it.
     await createSession(callSid, {
       phoneNumber,
       language: null,
-      answeredIds: [],
-      answers: {},
-      rawAnswers: [],
-      currentQuestionId: QUESTIONS[0].id,
-      awaitingLanguageDetection: true
+      awaitingLanguageDetection: true,
+      conversationHistory: [],
+      summary: knownProfile,
+      transcript: [],
+      retries: 0
     });
 
     const prompts = await Promise.all(
-      CANDIDATE_LANGUAGES.map((lang) =>
-        getSpokenAudioUrl({ text: "Welcome to MedAssist. Please tell us your name to begin.", languageCode: lang, creds })
-      )
+      CANDIDATE_LANGUAGES.map((lang) => getSpokenAudioUrl({ text: WELCOME_PROMPT, languageCode: lang, creds }))
     );
 
     return respondWithQuestion(res, prompts.map((p) => p.url));
@@ -173,8 +242,15 @@ exports.handleRecording = onRequest(async (req, res) => {
   try {
     const callSid = req.body.CallSid;
     const recordingUrl = req.body.RecordingUrl;
-    if (!callSid || !recordingUrl) {
+
+    if (!callSid) {
+      console.error("handleRecording: no CallSid in callback. Body:", JSON.stringify(req.body));
       return respondWithApology(res);
+    }
+
+    // Caller already hung up and nothing was recorded: nobody to talk to.
+    if (!recordingUrl && req.body.CallStatus === "completed") {
+      return res.type("text/xml").send(EMPTY_RESPONSE_XML);
     }
 
     const session = await getSession(callSid);
@@ -183,7 +259,14 @@ exports.handleRecording = onRequest(async (req, res) => {
     }
 
     const creds = azureCreds();
-    const audioBuffer = await fetchRecordingWithRetry(recordingUrl);
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+
+    if (!recordingUrl) {
+      console.warn("handleRecording: callback had no RecordingUrl, re-asking. Body:", JSON.stringify(req.body));
+      return await repromptOrEnd(res, callSid, session, creds);
+    }
+
+    const audioBuffer = await fetchRecordingBuffer(recordingUrl);
 
     let language = session.language;
     let transcript;
@@ -197,8 +280,6 @@ exports.handleRecording = onRequest(async (req, res) => {
       });
       language = detected.locale;
       transcript = detected.transcript;
-      await createPatientIfMissing(session.phoneNumber);
-      await upsertPatientProfile(session.phoneNumber, { preferredLanguage: language });
     } else {
       const result = await transcribe({
         audioBuffer,
@@ -210,70 +291,181 @@ exports.handleRecording = onRequest(async (req, res) => {
       transcript = result.transcript;
     }
 
-    const questionId = session.currentQuestionId;
-    const question = QUESTIONS.find((q) => q.id === questionId);
-    const englishAnswer = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
+    if (!transcript || !transcript.trim()) {
+      console.warn("handleRecording: recording transcribed to nothing, re-asking.");
+      return await repromptOrEnd(res, callSid, session, creds);
+    }
+
+    // Only lock in the caller's language once we actually understood something.
+    if (session.awaitingLanguageDetection) {
+      await createPatientIfMissing(session.phoneNumber);
+      await upsertPatientProfile(session.phoneNumber, { preferredLanguage: language });
+    }
+
+    const englishText = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
     const savedClip = await saveAudioClip({
       phoneNumber: session.phoneNumber,
-      questionId,
+      questionId: `turn-${(session.transcript || []).length}`,
       audioBuffer,
       contentType: "audio/wav"
     });
 
-    if (question && question.profileField) {
-      await upsertPatientProfile(session.phoneNumber, { [question.field]: englishAnswer });
-    }
+    const agentTurn = await converse({
+      history: session.conversationHistory || [],
+      patientMessage: englishText,
+      knownProfile: session.summary,
+      topics: TOPICS,
+      apiKey: geminiApiKey
+    });
 
-    const updatedAnswers = { ...session.answers, [question.field]: englishAnswer };
-    const updatedRawAnswers = [
-      ...session.rawAnswers,
-      { questionId, local: transcript, english: englishAnswer, audioUrl: savedClip.url }
+    const updatedTranscript = [
+      ...(session.transcript || []),
+      { role: "patient", local: transcript, english: englishText, audioUrl: savedClip.url },
+      { role: "medassist", english: agentTurn.reply, local: null }
     ];
-    const updatedAnsweredIds = [...session.answeredIds, questionId];
-
-    const profile = await getPatientByPhone(session.phoneNumber);
-    const nextQuestion = nextUnansweredQuestion(profile, updatedAnsweredIds);
 
     await updateSession(callSid, {
       language,
-      answers: updatedAnswers,
-      rawAnswers: updatedRawAnswers,
-      answeredIds: updatedAnsweredIds,
-      currentQuestionId: nextQuestion ? nextQuestion.id : null,
-      awaitingLanguageDetection: false
+      awaitingLanguageDetection: false,
+      conversationHistory: agentTurn.history,
+      summary: agentTurn.summary,
+      transcript: updatedTranscript,
+      retries: 0
     });
 
-    if (!nextQuestion) {
-      const ambulanceText = (updatedAnswers.needsAmbulance || "").toLowerCase();
-      const needsAmbulanceFlag =
-        ambulanceText.includes("yes") || ambulanceText.includes("ja") || ambulanceText.includes("yebo");
+    if (agentTurn.done) {
+      const profileUpdates = profileUpdatesFrom(agentTurn.summary);
+      if (Object.keys(profileUpdates).length) {
+        await upsertPatientProfile(session.phoneNumber, profileUpdates);
+      }
 
       await addHistoryEntry(session.phoneNumber, {
         language,
-        location: updatedAnswers.location || null,
-        symptoms: updatedAnswers.symptoms || null,
-        symptomDuration: updatedAnswers.symptomDuration || null,
-        lastVisit: updatedAnswers.lastVisit || null,
-        medicalHistory: updatedAnswers.medicalHistory || null,
-        medications: updatedAnswers.medications || null,
-        needsAmbulance: updatedAnswers.needsAmbulance || null,
-        needsAmbulanceFlag,
-        emergencyContactNumber: updatedAnswers.emergencyContactNumber || null,
-        rawAnswers: updatedRawAnswers
+        ...agentTurn.summary,
+        needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+        transcript: updatedTranscript
       });
 
-      const bye = await getSpokenAudioUrl({
-        text: "Thank you. Your information has been recorded and a healthcare worker will review it. Goodbye.",
-        languageCode: language,
-        creds
-      });
+      const bye = await getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
       return respondAndHangup(res, [bye.url]);
     }
 
-    const nextQuestionAudio = await getSpokenAudioUrl({ text: nextQuestion.text, languageCode: language, creds });
-    return respondWithQuestion(res, [nextQuestionAudio.url]);
+    const replyAudio = await getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
+    return respondWithQuestion(res, [replyAudio.url]);
   } catch (err) {
     console.error("handleRecording error:", err);
     return respondWithApology(res, err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Text-chat version of the exact same agent, for the patient website. No
+// Azure Speech needed here (the patient types, MedAssist types back) - only
+// Azure Translator, so the same agent can speak isiZulu/Afrikaans in text
+// form too. Sessions are keyed by a sessionId the page generates itself.
+// ---------------------------------------------------------------------------
+
+function setCors(res) {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+}
+
+exports.chatMessage = onRequest(async (req, res) => {
+  setCors(res);
+  if (req.method === "OPTIONS") {
+    return res.status(204).send("");
+  }
+
+  try {
+    const { sessionId, message, language, phoneNumber } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId is required" });
+    }
+
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const creds = azureCreds();
+    const session = await getSession(sessionId, "chatSessions");
+
+    // First request for this sessionId: no message yet, just start the
+    // conversation and send back MedAssist's opening line.
+    if (!session) {
+      const chosenLanguage = language || "en-ZA";
+      const existing = phoneNumber ? await getPatientByPhone(phoneNumber) : null;
+      const knownProfile = existing
+        ? { name: existing.name, surname: existing.surname, age: existing.age, provider: existing.provider }
+        : {};
+
+      const agentTurn = await converse({
+        history: [],
+        patientMessage: "(Chat started. Greet the patient warmly and begin.)",
+        knownProfile,
+        topics: TOPICS,
+        apiKey: geminiApiKey
+      });
+
+      const translatedGreeting = await translateText({ text: agentTurn.reply, toLanguageCode: chosenLanguage, ...creds });
+
+      await createSession(
+        sessionId,
+        {
+          phoneNumber: phoneNumber || null,
+          language: chosenLanguage,
+          conversationHistory: agentTurn.history,
+          summary: agentTurn.summary,
+          transcript: [{ role: "medassist", english: agentTurn.reply, local: translatedGreeting }]
+        },
+        "chatSessions"
+      );
+
+      return res.json({ reply: translatedGreeting, done: false });
+    }
+
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "message is required" });
+    }
+
+    const englishText = await translateToEnglish({ text: message, fromLanguageCode: session.language, ...creds });
+
+    const agentTurn = await converse({
+      history: session.conversationHistory || [],
+      patientMessage: englishText,
+      knownProfile: session.summary,
+      topics: TOPICS,
+      apiKey: geminiApiKey
+    });
+
+    const translatedReply = await translateText({ text: agentTurn.reply, toLanguageCode: session.language, ...creds });
+
+    const updatedTranscript = [
+      ...(session.transcript || []),
+      { role: "patient", local: message, english: englishText },
+      { role: "medassist", english: agentTurn.reply, local: translatedReply }
+    ];
+
+    await updateSession(
+      sessionId,
+      { conversationHistory: agentTurn.history, summary: agentTurn.summary, transcript: updatedTranscript },
+      "chatSessions"
+    );
+
+    if (agentTurn.done && session.phoneNumber) {
+      const profileUpdates = profileUpdatesFrom(agentTurn.summary);
+      if (Object.keys(profileUpdates).length) {
+        await createPatientIfMissing(session.phoneNumber);
+        await upsertPatientProfile(session.phoneNumber, profileUpdates);
+      }
+      await addHistoryEntry(session.phoneNumber, {
+        language: session.language,
+        ...agentTurn.summary,
+        needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+        transcript: updatedTranscript
+      });
+    }
+
+    return res.json({ reply: translatedReply, done: agentTurn.done });
+  } catch (err) {
+    console.error("chatMessage error:", err);
+    return res.status(500).json({ error: "Something went wrong. Please try again." });
   }
 });

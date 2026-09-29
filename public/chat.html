@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>MedAssist — Talk to us</title>
+<style>
+  :root {
+    --ink: #1b2b26;
+    --paper: #f3f1e8;
+    --panel: #ffffff;
+    --teal: #2f5d53;
+    --teal-deep: #1f4038;
+    --amber: #c8862a;
+    --line: #ddd8c6;
+    --patient-bubble: #e9e5d4;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: inherit; }
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    padding: 18px 20px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--paper);
+    position: sticky;
+    top: env(safe-area-inset-top, 0px);
+    z-index: 5;
+  }
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .brand .mark {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--teal);
+    flex: none;
+  }
+  .brand h1 {
+    font-size: 20px;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .brand p {
+    margin: 4px 0 0 20px;
+    font-size: 14px;
+    color: #5b6b64;
+    max-width: 60ch;
+  }
+
+  main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  /* --- Setup screen --- */
+  #setup {
+    max-width: 440px;
+    margin: 0 auto;
+    padding: 28px 20px 40px;
+    width: 100%;
+  }
+  #setup h2 {
+    font-size: 17px;
+    margin: 0 0 4px;
+  }
+  #setup .hint {
+    font-size: 14px;
+    color: #5b6b64;
+    margin: 0 0 20px;
+  }
+  .field { margin-bottom: 16px; }
+  .field label {
+    display: block;
+    font-size: 13px;
+    color: #43524c;
+    margin-bottom: 6px;
+  }
+  .field select, .field input {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    font-size: 16px;
+    color: var(--ink);
+  }
+  .field select:focus, .field input:focus, button:focus-visible, #composer input:focus-visible {
+    outline: 2px solid var(--teal);
+    outline-offset: 2px;
+  }
+  #startBtn {
+    width: 100%;
+    padding: 14px 16px;
+    border: none;
+    border-radius: 10px;
+    background: var(--teal);
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #startBtn:hover { background: var(--teal-deep); }
+  #startBtn:disabled { opacity: 0.6; cursor: default; }
+
+  /* --- Chat screen --- */
+  #chat {
+    display: none;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 16px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .msg {
+    max-width: 78%;
+    padding: 11px 14px;
+    border-radius: 14px;
+    font-size: 16px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .msg.assistant {
+    align-self: flex-start;
+    background: var(--teal);
+    color: #fff;
+    border-bottom-left-radius: 4px;
+  }
+  .msg.patient {
+    align-self: flex-end;
+    background: var(--patient-bubble);
+    color: var(--ink);
+    border-bottom-right-radius: 4px;
+  }
+  .msg.typing {
+    align-self: flex-start;
+    background: var(--teal);
+    color: #fff;
+    opacity: 0.7;
+    font-style: italic;
+  }
+  .msg.error {
+    align-self: center;
+    background: transparent;
+    border: 1px solid #b5493f;
+    color: #b5493f;
+    font-size: 14px;
+  }
+  .done-banner {
+    align-self: center;
+    text-align: center;
+    font-size: 13px;
+    color: #5b6b64;
+    padding: 6px 14px;
+  }
+
+  #composer {
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--line);
+    background: var(--paper);
+  }
+  #composer input {
+    flex: 1;
+    padding: 13px 14px;
+    border-radius: 24px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    font-size: 16px;
+    color: var(--ink);
+  }
+  #composer button {
+    width: 48px; height: 48px;
+    border-radius: 50%;
+    border: none;
+    background: var(--amber);
+    color: #fff;
+    font-size: 18px;
+    cursor: pointer;
+    flex: none;
+  }
+  #composer button:disabled { opacity: 0.5; cursor: default; }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ink: #eee7d8;
+      --paper: #16211d;
+      --panel: #1e2b26;
+      --teal: #4c8577;
+      --teal-deep: #6aa494;
+      --amber: #d99a4a;
+      --line: #33413b;
+      --patient-bubble: #2a352f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ink: #eee7d8;
+    --paper: #16211d;
+    --panel: #1e2b26;
+    --teal: #4c8577;
+    --teal-deep: #6aa494;
+    --amber: #d99a4a;
+    --line: #33413b;
+    --patient-bubble: #2a352f;
+  }
+</style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <h1>MedAssist</h1>
+    </div>
+    <p>Tell us how you're feeling. A healthcare worker will review this before you're seen.</p>
+  </header>
+
+  <main>
+    <section id="setup">
+      <h2>Before we start</h2>
+      <p class="hint">This helps MedAssist talk to you the way you prefer.</p>
+
+      <div class="field">
+        <label for="language">Language</label>
+        <select id="language">
+          <option value="en-ZA">English</option>
+          <option value="zu-ZA">isiZulu</option>
+          <option value="af-ZA">Afrikaans</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="phone">Phone number (optional)</label>
+        <input id="phone" type="tel" inputmode="tel" placeholder="e.g. 0821234567" autocomplete="tel" />
+      </div>
+
+      <button id="startBtn" type="button">Start</button>
+    </section>
+
+    <section id="chat">
+      <div id="log" role="log" aria-live="polite"></div>
+      <form id="composer">
+        <input id="input" type="text" placeholder="Type your reply…" autocomplete="off" disabled />
+        <button id="sendBtn" type="submit" disabled aria-label="Send">➤</button>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    // Update this if you deploy functions to a different project/region.
+    const FUNCTIONS_BASE_URL = "https://us-central1-medassist-397be.cloudfunctions.net";
+
+    const setupEl = document.getElementById("setup");
+    const chatEl = document.getElementById("chat");
+    const logEl = document.getElementById("log");
+    const composerEl = document.getElementById("composer");
+    const inputEl = document.getElementById("input");
+    const sendBtn = document.getElementById("sendBtn");
+    const startBtn = document.getElementById("startBtn");
+    const languageEl = document.getElementById("language");
+    const phoneEl = document.getElementById("phone");
+
+    const sessionId =
+      (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    let conversationDone = false;
+
+    function addMessage(role, text) {
+      const el = document.createElement("div");
+      el.className = `msg ${role}`;
+      el.textContent = text;
+      logEl.appendChild(el);
+      logEl.scrollTop = logEl.scrollHeight;
+      return el;
+    }
+
+    function addDoneBanner() {
+      const el = document.createElement("div");
+      el.className = "done-banner";
+      el.textContent = "Thank you — your information has been recorded for a healthcare worker to review.";
+      logEl.appendChild(el);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setBusy(busy) {
+      inputEl.disabled = busy || conversationDone;
+      sendBtn.disabled = busy || conversationDone;
+    }
+
+    async function callChat(body) {
+      const response = await fetch(`${FUNCTIONS_BASE_URL}/chatMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.error || `Request failed (${response.status})`);
+      }
+      return data;
+    }
+
+    startBtn.addEventListener("click", async () => {
+      startBtn.disabled = true;
+      startBtn.textContent = "Connecting…";
+      try {
+        const data = await callChat({
+          sessionId,
+          language: languageEl.value,
+          phoneNumber: phoneEl.value ? phoneEl.value.trim() : undefined
+        });
+        setupEl.style.display = "none";
+        chatEl.style.display = "flex";
+        addMessage("assistant", data.reply);
+        setBusy(false);
+        inputEl.focus();
+      } catch (err) {
+        startBtn.disabled = false;
+        startBtn.textContent = "Start";
+        addMessage("error", err.message || "Could not connect. Please try again.");
+      }
+    });
+
+    composerEl.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const text = inputEl.value.trim();
+      if (!text || conversationDone) return;
+
+      addMessage("patient", text);
+      inputEl.value = "";
+      setBusy(true);
+
+      const typingEl = addMessage("typing", "MedAssist is typing…");
+
+      try {
+        const data = await callChat({ sessionId, message: text });
+        typingEl.remove();
+        addMessage("assistant", data.reply);
+        if (data.done) {
+          conversationDone = true;
+          addDoneBanner();
+        }
+      } catch (err) {
+        typingEl.remove();
+        addMessage("error", err.message || "Something went wrong. Please try again.");
+      } finally {
+        setBusy(false);
+        if (!conversationDone) inputEl.focus();
+      }
+    });
+  </script>
+</body>
+</html>

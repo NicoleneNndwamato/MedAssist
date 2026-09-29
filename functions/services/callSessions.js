@@ -4,25 +4,29 @@ function db() {
   return admin.firestore();
 }
 
-// One ephemeral document per in-progress phone call, keyed by Plivo's
-// CallUUID. Each Plivo webhook POST is a fresh, stateless HTTP request, so
-// this is what remembers "which question are we on and what's been said so
-// far" between one <Record> and the next - there's no in-memory app state
-// to hold it the way CallScreen.js used to.
-async function createSession(callSid, data) {
+// One ephemeral document per in-progress conversation. Phone calls are
+// keyed by SignalWire's CallSid (collection "callSessions" - the default);
+// website chats are keyed by a client-generated sessionId (pass collection
+// = "chatSessions"). Same shape either way: conversationHistory (Gemini's
+// running transcript), summary (the agent's best-current understanding of
+// the intake fields), transcript (human-readable log), language, retries.
+//
+// Each webhook/request is a fresh, stateless HTTP call, so this is what
+// remembers "where were we" between one turn and the next.
+async function createSession(id, data, collection = "callSessions") {
   await db()
-    .collection("callSessions")
-    .doc(callSid)
+    .collection(collection)
+    .doc(id)
     .set({ ...data, createdAt: admin.firestore.FieldValue.serverTimestamp() });
 }
 
-async function getSession(callSid) {
-  const snap = await db().collection("callSessions").doc(callSid).get();
+async function getSession(id, collection = "callSessions") {
+  const snap = await db().collection(collection).doc(id).get();
   return snap.exists ? snap.data() : null;
 }
 
-async function updateSession(callSid, fields) {
-  await db().collection("callSessions").doc(callSid).set(fields, { merge: true });
+async function updateSession(id, fields, collection = "callSessions") {
+  await db().collection(collection).doc(id).set(fields, { merge: true });
 }
 
 module.exports = { createSession, getSession, updateSession };
