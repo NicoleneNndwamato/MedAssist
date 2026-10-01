@@ -71,34 +71,36 @@ async function textBookingConfirmation({ when, language }) {
   }
 }
 
-async function scheduleAndText({ result, summary, language }) {
-  let when;
+async function chooseAppointmentTime(summary) {
   try {
-    when = await pickAppointmentTime({
+    return await pickAppointmentTime({
       phrase: summary && summary.appointmentTime,
       apiKey: process.env.GROQ_API_KEY
     });
   } catch (err) {
-    console.error("scheduleAndText: could not pick a time:", err);
-    return;
+    console.error("chooseAppointmentTime failed:", err);
+    return null;
   }
+}
 
+async function saveAndText({ result, when, language }) {
   if (result && result.appointmentId) {
     try {
       await admin.firestore().collection("appointments").doc(result.appointmentId).update({
+        appointment: spokenDateTime(when),
         scheduledAt: admin.firestore.Timestamp.fromDate(when),
         scheduledLabel: spokenDateTime(when),
         appointmentStatus: "BOOKED"
       });
     } catch (err) {
-      console.error("scheduleAndText: could not save the chosen time:", err);
+      console.error("saveAndText: could not save the chosen time:", err);
     }
   }
 
   await textBookingConfirmation({ when, language });
 }
 
-async function bookCase({ patientId, summary, needsAmbulanceFlag, language, transcript, source, sendText }) {
+async function bookCase({ patientId, summary, needsAmbulanceFlag, language, transcript, source, when }) {
   let result = null;
   try {
     const priority = needsAmbulanceFlag ? "IMMEDIATE" : (summary && summary.priority) || "STANDARD";
@@ -115,8 +117,8 @@ async function bookCase({ patientId, summary, needsAmbulanceFlag, language, tran
     console.error("bookCase failed:", err);
   }
 
-  if (sendText) {
-    await scheduleAndText({ result, summary, language });
+  if (when) {
+    await saveAndText({ result, when, language });
   }
   return result;
 }
@@ -567,9 +569,12 @@ async function finalizeSession(callSid, session) {
 
   await createPatientIfMissing(session.phoneNumber);
   await upsertPatientProfile(session.phoneNumber, { ...profileUpdatesFrom(summary), preferredLanguage: language });
+  const when = session.ambulanceYes === false ? await chooseAppointmentTime(summary) : null;
+
   await addHistoryEntry(session.phoneNumber, {
     language,
     ...summary,
+    appointment: when ? spokenDateTime(when) : null,
     needsAmbulanceFlag: ambulanceNeeded,
     transcript
   });
@@ -581,7 +586,7 @@ async function finalizeSession(callSid, session) {
     language,
     transcript,
     source: "phone",
-    sendText: session.ambulanceYes === false
+    when
   });
 
   await updateSession(callSid, { status: "processed", summary, transcript }, CALL_SESSIONS);
@@ -696,6 +701,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
     );
 
     if (agentTurn.done && !session.booked) {
+      const when = chatAmbulance ? null : await chooseAppointmentTime(agentTurn.summary);
       if (session.phoneNumber) {
         const profileUpdates = profileUpdatesFrom(agentTurn.summary);
         if (Object.keys(profileUpdates).length) {
@@ -705,6 +711,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
         await addHistoryEntry(session.phoneNumber, {
           language: session.language,
           ...agentTurn.summary,
+          appointment: when ? spokenDateTime(when) : null,
           needsAmbulanceFlag: chatAmbulance,
           transcript: updatedTranscript
         });
@@ -716,7 +723,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
         language: session.language,
         transcript: updatedTranscript,
         source: "chat",
-        sendText: !chatAmbulance
+        when
       });
       await updateSession(sessionId, { booked: true }, "chatSessions");
     }
