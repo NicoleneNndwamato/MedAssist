@@ -20,7 +20,9 @@ const {
   addHistoryEntry
 } = require("./services/patientRepository");
 const { createSession, getSession, updateSession } = require("./services/callSessions");
-const { bookAppointment } = require("./Booking");
+const { bookAppointment, spokenDateTime } = require("./Booking");
+const { pickAppointmentTime } = require("./services/appointmentTime");
+const { sendSms } = require("./services/sms");
 
 const TOPICS = QUESTIONS.map((q) => q.text);
 
@@ -40,7 +42,7 @@ const PHONE_FIELDS = [
 ];
 
 const CLOSING_AMBULANCE = "Thank you. We will direct you to a 112 operator who will call you shortly. Goodbye.";
-const CLOSING_APPOINTMENT = "Thank you. We will contact you shortly by email with the details of your appointment. Goodbye.";
+const CLOSING_APPOINTMENT = "Thank you. We will contact you shortly by SMS with the details of your appointment. Goodbye.";
 
 function saidYes(text) {
   const t = String(text || "").trim().toLowerCase();
@@ -56,10 +58,51 @@ function transcriptToText(transcript) {
     .join("\n");
 }
 
-async function bookCase({ patientId, summary, needsAmbulanceFlag, language, transcript, source }) {
+const SMS_RECIPIENT = "+27716291102";
+
+async function textBookingConfirmation({ when, language }) {
+  try {
+    const english = `Your appointment has been booked for ${spokenDateTime(when)}. If you need assistance, feel free to call us.`;
+    const translated = await translateText({ text: english, toLanguageCode: language, ...azureCreds() });
+    await sendSms({ to: SMS_RECIPIENT, body: `MedAssist: ${translated}` });
+    console.log("textBookingConfirmation: SMS sent");
+  } catch (err) {
+    console.error("textBookingConfirmation failed:", err);
+  }
+}
+
+async function scheduleAndText({ result, summary, language }) {
+  let when;
+  try {
+    when = await pickAppointmentTime({
+      phrase: summary && summary.appointmentTime,
+      apiKey: process.env.GROQ_API_KEY
+    });
+  } catch (err) {
+    console.error("scheduleAndText: could not pick a time:", err);
+    return;
+  }
+
+  if (result && result.appointmentId) {
+    try {
+      await admin.firestore().collection("appointments").doc(result.appointmentId).update({
+        scheduledAt: admin.firestore.Timestamp.fromDate(when),
+        scheduledLabel: spokenDateTime(when),
+        appointmentStatus: "BOOKED"
+      });
+    } catch (err) {
+      console.error("scheduleAndText: could not save the chosen time:", err);
+    }
+  }
+
+  await textBookingConfirmation({ when, language });
+}
+
+async function bookCase({ patientId, summary, needsAmbulanceFlag, language, transcript, source, sendText }) {
+  let result = null;
   try {
     const priority = needsAmbulanceFlag ? "IMMEDIATE" : (summary && summary.priority) || "STANDARD";
-    const result = await bookAppointment({
+    result = await bookAppointment({
       patientId,
       summary: { ...(summary || {}), priority },
       needsAmbulanceFlag,
@@ -68,11 +111,14 @@ async function bookCase({ patientId, summary, needsAmbulanceFlag, language, tran
       source
     });
     console.log(`bookCase: appointment ${result.appointmentId} created (${result.tier}, booked=${result.booked})`);
-    return result;
   } catch (err) {
     console.error("bookCase failed:", err);
-    return null;
   }
+
+  if (sendText) {
+    await scheduleAndText({ result, summary, language });
+  }
+  return result;
 }
 
 async function heardAmbulanceAnswer({ recordingUrl, language, creds }) {
@@ -94,7 +140,7 @@ async function heardAmbulanceAnswer({ recordingUrl, language, creds }) {
   }
 }
 
-const RECORD_SILENCE_TIMEOUT_SECONDS = 1;
+const RECORD_SILENCE_TIMEOUT_SECONDS = 2;
 const RECORD_MAX_LENGTH_SECONDS = 45;
 
 const MAX_REPROMPTS =1;
@@ -534,7 +580,8 @@ async function finalizeSession(callSid, session) {
     needsAmbulanceFlag: ambulanceNeeded,
     language,
     transcript,
-    source: "phone"
+    source: "phone",
+    sendText: session.ambulanceYes === false
   });
 
   await updateSession(callSid, { status: "processed", summary, transcript }, CALL_SESSIONS);
@@ -668,7 +715,8 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
         needsAmbulanceFlag: chatAmbulance,
         language: session.language,
         transcript: updatedTranscript,
-        source: "chat"
+        source: "chat",
+        sendText: !chatAmbulance
       });
       await updateSession(sessionId, { booked: true }, "chatSessions");
     }
