@@ -65,6 +65,10 @@ function mergeSummary(known, fromModel) {
     if (hasValue(value)) merged[key] = value;
     else if (!(key in merged)) merged[key] = null;
   });
+  // Firestore rejects undefined - turn any into null.
+  Object.keys(merged).forEach((key) => {
+    if (merged[key] === undefined) merged[key] = null;
+  });
   return merged;
 }
 
@@ -235,6 +239,17 @@ async function converse({ history, patientMessage, knownProfile, topics, apiKey 
   const missing = missingFields(summary, needsAmbulanceFlag);
   const modelSaysDone = !!parsed.done;
   const turnCapReached = patientTurns >= MAX_PATIENT_TURNS;
+
+  console.log(
+    "converse:",
+    JSON.stringify({
+      patientTurns,
+      modelSaysDone,
+      needsAmbulanceFlag,
+      missing,
+      filled: Object.keys(summary).filter((k) => hasValue(summary[k]))
+    })
+  );
 
   // The model only gets to end the call if the required data is really there
   // (or the conversation has run absurdly long).

@@ -4,6 +4,8 @@ const fetch = require("node-fetch");
 const { playAndRecord, playAndHangup, sayAndHangup, sayAndRecord } = require("./services/voiceMarkup");
 
 admin.initializeApp({ storageBucket: "medassist-397be.firebasestorage.app" });
+// Never crash a call because some optional field happens to be undefined.
+admin.firestore().settings({ ignoreUndefinedProperties: true });
 
 const { QUESTIONS } = require("./services/intakeQuestions");
 const { CANDIDATE_LANGUAGES } = require("./config/languages");
@@ -37,10 +39,10 @@ const MAX_REPROMPTS = 2;
 
 // SignalWire gives up on a webhook after roughly 15 seconds and silently
 // hangs up ("normal clearing" in its logs). Every turn does STT + translate +
-// LLM + TTS, so we (a) keep the instance warm, (b) run independent steps in
+// LLM + TTS, so we (a) use enough memory/CPU, (b) run independent steps in
 // parallel, and (c) race the work against a deadline so the caller hears a
-// friendly "say that again" instead of dead air.
-const HOOK_OPTIONS = { timeoutSeconds: 60, memory: "512MiB", minInstances: 1 };
+// friendly "say that again" instead of dead air. (No minInstances: that costs money.)
+const HOOK_OPTIONS = { timeoutSeconds: 60, memory: "512MiB" };
 const TURN_DEADLINE_MS = 12000;
 
 function makeTimer(label) {
@@ -73,6 +75,18 @@ function azureCreds() {
     translatorKey: process.env.AZURE_TRANSLATOR_KEY,
     translatorRegion: process.env.AZURE_TRANSLATOR_REGION,
     translatorEndpoint: process.env.AZURE_TRANSLATOR_ENDPOINT || "https://api.cognitive.microsofttranslator.com"
+  };
+}
+
+// Builds the "already on file" profile for the agent: every field is a real
+// value or null - never undefined (Firestore rejects undefined).
+function knownProfileFrom(patient) {
+  const p = patient || {};
+  return {
+    name: p.name ?? null,
+    surname: p.surname ?? null,
+    age: p.age ?? null,
+    provider: p.provider ?? null
   };
 }
 
@@ -208,9 +222,7 @@ exports.incomingCall = onRequest(HOOK_OPTIONS, async (req, res) => {
     }
 
     const existing = await getPatientByPhone(phoneNumber);
-    const knownProfile = existing
-      ? { name: existing.name, surname: existing.surname, age: existing.age, provider: existing.provider }
-      : {};
+    const knownProfile = knownProfileFrom(existing);
 
     if (existing && existing.preferredLanguage) {
       const language = existing.preferredLanguage;
@@ -370,8 +382,8 @@ async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
   // Only lock in the caller's language once we actually understood something.
   const languageSetup = session.awaitingLanguageDetection
     ? createPatientIfMissing(session.phoneNumber).then(() =>
-      upsertPatientProfile(session.phoneNumber, { preferredLanguage: language })
-    )
+        upsertPatientProfile(session.phoneNumber, { preferredLanguage: language })
+      )
     : Promise.resolve();
 
   const englishText = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
@@ -486,9 +498,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
     if (!session) {
       const chosenLanguage = language || "en-ZA";
       const existing = phoneNumber ? await getPatientByPhone(phoneNumber) : null;
-      const knownProfile = existing
-        ? { name: existing.name, surname: existing.surname, age: existing.age, provider: existing.provider }
-        : {};
+      const knownProfile = knownProfileFrom(existing);
 
       const agentTurn = await converse({
         history: [],
