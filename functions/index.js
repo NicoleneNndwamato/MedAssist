@@ -14,6 +14,7 @@ const { translateToEnglish, translateText } = require("./services/azureTranslate
 const { getSpokenAudioUrl } = require("./services/ttsCache");
 const { saveAudioClip } = require("./services/audioStorage");
 const { converse } = require("./services/medAssistAgent");
+const { bookAppointment, getCities } = require("./services/booking");
 const {
   getPatientByPhone,
   createPatientIfMissing,
@@ -44,6 +45,13 @@ const MAX_REPROMPTS = 2;
 // friendly "say that again" instead of dead air. (No minInstances: that costs money.)
 const HOOK_OPTIONS = { timeoutSeconds: 60, memory: "512MiB" };
 const TURN_DEADLINE_MS = 12000;
+
+// TEST SWITCH: set USE_SAY_REPLIES=true in functions/.env to have SignalWire
+// read the agent's reply with its own built-in voice (English only) instead
+// of our Azure TTS -> Cloud Storage -> <Play> pipeline. Much faster and has
+// far fewer moving parts. If calls work in this mode, the audio-file
+// pipeline is the problem.
+const USE_SAY_REPLIES = process.env.USE_SAY_REPLIES === "true";
 
 function makeTimer(label) {
   const start = Date.now();
@@ -88,6 +96,14 @@ function knownProfileFrom(patient) {
     age: p.age ?? null,
     provider: p.provider ?? null
   };
+}
+
+// Plain-text version of the conversation, stored on the appointment so staff
+// can read what the patient said.
+function transcriptToText(entries) {
+  return (entries || [])
+    .map((t) => `${t.role === "medassist" ? "MedAssist" : "Patient"}: ${t.english || t.local || ""}`)
+    .join("\n");
 }
 
 function functionUrl(name) {
@@ -235,7 +251,8 @@ exports.incomingCall = onRequest(HOOK_OPTIONS, async (req, res) => {
         patientMessage: kickoff,
         knownProfile,
         topics: TOPICS,
-        apiKey: groqApiKey
+        apiKey: groqApiKey,
+        cities: await getCities()
       });
 
       await createSession(callSid, {
@@ -394,9 +411,32 @@ async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
     patientMessage: englishText,
     knownProfile: session.summary,
     topics: TOPICS,
-    apiKey: groqApiKey
+    apiKey: groqApiKey,
+        cities: await getCities()
   });
   tick(`LLM (done=${agentTurn.done})`);
+
+  // When the intake is complete, book the appointment in code (hospital,
+  // doctor and time chosen by urgency) and have the caller hear the result.
+  // `session.bookingConfirmation` guards against booking twice if SignalWire
+  // ever repeats a request.
+  let booking = null;
+  if (agentTurn.done) {
+    if (session.bookingConfirmation) {
+      agentTurn.reply = session.bookingConfirmation;
+    } else {
+      booking = await bookAppointment({
+        patientId: session.phoneNumber,
+        summary: agentTurn.summary,
+        needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+        language,
+        transcriptText: transcriptToText([...(session.transcript || []), { role: "patient", english: englishText }]),
+        source: "phone"
+      });
+      agentTurn.reply = booking.confirmationText;
+      tick(`booked (${booking.tier}, booked=${booking.booked})`);
+    }
+  }
 
   const [savedClip] = await Promise.all([savedClipPromise, languageSetup]);
 
@@ -407,7 +447,10 @@ async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
   ];
 
   // Start TTS for the reply while we write to Firestore - they're independent.
-  const replyAudioPromise = getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
+  const saySimple = USE_SAY_REPLIES && language === "en-ZA";
+  const replyAudioPromise = saySimple
+    ? Promise.resolve(null)
+    : getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
 
   const sessionWrite = updateSession(callSid, {
     language,
@@ -415,7 +458,8 @@ async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
     conversationHistory: agentTurn.history,
     summary: agentTurn.summary,
     transcript: updatedTranscript,
-    retries: 0
+    retries: 0,
+    ...(booking ? { appointmentId: booking.appointmentId, bookingConfirmation: booking.confirmationText } : {})
   });
 
   // Save the permanent profile EVERY turn, not just at the end, so a dropped
@@ -428,23 +472,41 @@ async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
   const [replyAudio] = await Promise.all([replyAudioPromise, sessionWrite, profileWrite]);
   tick("TTS + Firestore writes");
 
+  // Check, from our side, that the reply audio can actually be downloaded.
+  // (Range request, because the signed URL only allows GET, not HEAD.)
+  if (replyAudio) {
+    try {
+      const probe = await fetch(replyAudio.url, { headers: { Range: "bytes=0-1" } });
+      console.log(
+        `[audio-check] status=${probe.status} type=${probe.headers.get("content-type")} ` +
+          `range=${probe.headers.get("content-range")} len=${probe.headers.get("content-length")}`
+      );
+    } catch (probeErr) {
+      console.error("[audio-check] could not fetch reply audio:", probeErr.message);
+    }
+  }
+
   if (agentTurn.done) {
     await addHistoryEntry(session.phoneNumber, {
       language,
       ...agentTurn.summary,
       needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+      appointmentId: booking ? booking.appointmentId : session.appointmentId || null,
       transcript: updatedTranscript
     });
-    return { xml: playAndHangup([replyAudio.url]) };
+    const byeXml = replyAudio ? playAndHangup([replyAudio.url]) : sayAndHangup(agentTurn.reply);
+    console.log("[xml-out]", byeXml);
+    return { xml: byeXml };
   }
 
-  return {
-    xml: playAndRecord([replyAudio.url], {
-      actionUrl: functionUrl("handleRecording"),
-      timeoutSeconds: RECORD_SILENCE_TIMEOUT_SECONDS,
-      maxLengthSeconds: RECORD_MAX_LENGTH_SECONDS
-    })
+  const recordOpts = {
+    actionUrl: functionUrl("handleRecording"),
+    timeoutSeconds: RECORD_SILENCE_TIMEOUT_SECONDS,
+    maxLengthSeconds: RECORD_MAX_LENGTH_SECONDS
   };
+  const xml = replyAudio ? playAndRecord([replyAudio.url], recordOpts) : sayAndRecord(agentTurn.reply, recordOpts);
+  console.log("[xml-out]", xml);
+  return { xml };
 }
 
 // repromptOrEnd() was written to send on a response object; this lets
@@ -505,7 +567,8 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
         patientMessage: "(Chat started. Greet the patient warmly and begin.)",
         knownProfile,
         topics: TOPICS,
-        apiKey: groqApiKey
+        apiKey: groqApiKey,
+        cities: await getCities()
       });
 
       const translatedGreeting = await translateText({ text: agentTurn.reply, toLanguageCode: chosenLanguage, ...creds });
@@ -536,8 +599,26 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
       patientMessage: englishText,
       knownProfile: session.summary,
       topics: TOPICS,
-      apiKey: groqApiKey
+      apiKey: groqApiKey,
+        cities: await getCities()
     });
+
+    let booking = null;
+    if (agentTurn.done) {
+      if (session.bookingConfirmation) {
+        agentTurn.reply = session.bookingConfirmation;
+      } else {
+        booking = await bookAppointment({
+          patientId: session.phoneNumber || `chat-${sessionId}`,
+          summary: agentTurn.summary,
+          needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+          language: session.language,
+          transcriptText: transcriptToText([...(session.transcript || []), { role: "patient", english: englishText }]),
+          source: "chat"
+        });
+        agentTurn.reply = booking.confirmationText;
+      }
+    }
 
     const translatedReply = await translateText({ text: agentTurn.reply, toLanguageCode: session.language, ...creds });
 
@@ -549,7 +630,12 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
 
     await updateSession(
       sessionId,
-      { conversationHistory: agentTurn.history, summary: agentTurn.summary, transcript: updatedTranscript },
+      {
+        conversationHistory: agentTurn.history,
+        summary: agentTurn.summary,
+        transcript: updatedTranscript,
+        ...(booking ? { appointmentId: booking.appointmentId, bookingConfirmation: booking.confirmationText } : {})
+      },
       "chatSessions"
     );
 
@@ -563,6 +649,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
         language: session.language,
         ...agentTurn.summary,
         needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+        appointmentId: booking ? booking.appointmentId : session.appointmentId || null,
         transcript: updatedTranscript
       });
     }
@@ -571,7 +658,10 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
       reply: translatedReply,
       done: agentTurn.done,
       summary: agentTurn.summary,
-      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag
+      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+      appointment: booking
+        ? { id: booking.appointmentId, facility: booking.facilityName, doctor: booking.doctorName, when: booking.scheduledAt }
+        : null
     });
   } catch (err) {
     console.error("chatMessage error:", err);
