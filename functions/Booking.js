@@ -1,34 +1,14 @@
 const admin = require("firebase-admin");
-const { SUPPORTED_LANGUAGES } = require("../config/languages");
+const { SUPPORTED_LANGUAGES } = require("./config/languages");
 
-// ---------------------------------------------------------------------------
-// Appointment booking, decided entirely in CODE (never by the AI), so the
-// caller is only ever told a time/doctor/hospital that really got saved.
-//
-// Urgency tiers (from the agent's `priority`):
-//   EMERGENCY  IMMEDIATE, VERY_URGENT (or ambulance flag)
-//              -> booked automatically ~30 minutes from now, no questions
-//   URGENT     URGENT
-//              -> earliest free slot, any day of the week
-//   ROUTINE    STANDARD, NON_URGENT
-//              -> the free slot closest to the time the patient said they
-//                 are available (weekdays only)
-//
-// "Near them" = a facility whose `location` (city) matches the patient's
-// area. Facilities have no map coordinates in the database, so this is a
-// city match. "Available doctor" = a doctor at that facility with no other
-// appointment inside the same 30-minute slot.
-// ---------------------------------------------------------------------------
-
-// ---- Tunable settings -----------------------------------------------------
 const TZ = "Africa/Johannesburg";
-const SAST_OFFSET_MS = 2 * 60 * 60 * 1000; // South Africa has no daylight saving
+const SAST_OFFSET_MS = 2 * 60 * 60 * 1000;
 const SLOT_MINUTES = 30;
 const SLOT_MS = SLOT_MINUTES * 60 * 1000;
-const DAY_START_HOUR = 8; // first appointment 08:00
-const DAY_END_HOUR = 17; // last appointment starts 16:30
-const SEARCH_DAYS = 14; // how far ahead we look for a free slot
-const MIN_LEAD_MINUTES = 30; // never book a routine/urgent slot sooner than this
+const DAY_START_HOUR = 8;
+const DAY_END_HOUR = 17;
+const SEARCH_DAYS = 14;
+const MIN_LEAD_MINUTES = 30;
 const EMERGENCY_LEAD_MINUTES = 30;
 const CITY_CACHE_MS = 5 * 60 * 1000;
 
@@ -38,7 +18,6 @@ function db() {
   return admin.firestore();
 }
 
-// ---- Priority helpers -----------------------------------------------------
 function normalizePriority(value) {
   if (!value) return null;
   const p = String(value).trim().toUpperCase().replace(/[\s-]+/g, "_");
@@ -52,7 +31,6 @@ function tierOf(priority, needsAmbulanceFlag) {
   return "ROUTINE";
 }
 
-// ---- Time helpers (everything is interpreted as South African time) --------
 function pad(n) {
   return String(n).padStart(2, "0");
 }
@@ -65,7 +43,7 @@ function sastParts(date) {
     d: d.getUTCDate(),
     h: d.getUTCHours(),
     min: d.getUTCMinutes(),
-    weekday: d.getUTCDay() // 0 = Sunday
+    weekday: d.getUTCDay()
   };
 }
 
@@ -73,7 +51,6 @@ function fromSast(y, m, d, h, min) {
   return new Date(Date.UTC(y, m, d, h, min) - SAST_OFFSET_MS);
 }
 
-// "2026-10-02T10:00" (South African time) -> Date, or null if unusable.
 function parsePreferred(text) {
   const m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{1,2}):(\d{2})/.exec(String(text || "").trim());
   if (!m) return null;
@@ -92,19 +69,16 @@ const MONTHS = [
   "July", "August", "September", "October", "November", "December"
 ];
 
-// "Tuesday 6 October at 10:30" - easy to read aloud on a phone call.
 function spokenDateTime(date) {
   const p = sastParts(date);
   return `${WEEKDAYS[p.weekday]} ${p.d} ${MONTHS[p.m]} at ${pad(p.h)}:${pad(p.min)}`;
 }
 
-// Used in the agent's prompt so it can turn "tomorrow at 10" into a real date.
 function nowForPrompt(now = new Date()) {
   const p = sastParts(now);
   return `${WEEKDAYS[p.weekday]} ${p.d} ${MONTHS[p.m]} ${p.y}, ${pad(p.h)}:${pad(p.min)} (South Africa time). In the format used below that is ${toSastIso(now)}`;
 }
 
-// ---- Facilities / cities --------------------------------------------------
 let facilityCache = { at: 0, list: [] };
 
 async function getFacilities() {
@@ -122,8 +96,6 @@ async function getCities() {
   return [...new Set(facilities.map((f) => f.location).filter(Boolean))];
 }
 
-// Works out which facility city the patient is closest to: first from the
-// agent's own `nearestCity`, then by looking for a city name in what they said.
 function resolveCity(summary, cities) {
   const norm = (s) => String(s || "").trim().toLowerCase();
   const list = cities || [];
@@ -135,7 +107,6 @@ function resolveCity(summary, cities) {
   return exact || findIn(summary && summary.nearestCity) || findIn(summary && summary.location) || null;
 }
 
-// ---- Slot search ----------------------------------------------------------
 function candidateSlots(target, now, { weekdaysOnly }) {
   const earliest = new Date(now.getTime() + MIN_LEAD_MINUTES * 60 * 1000);
   const horizon = new Date(now.getTime() + SEARCH_DAYS * 24 * 60 * 60 * 1000);
@@ -152,7 +123,7 @@ function candidateSlots(target, now, { weekdaysOnly }) {
       }
     }
   }
-  // Closest to what the patient asked for first; on a tie, the earlier one.
+
   slots.sort((a, b) => Math.abs(a - target) - Math.abs(b - target) || a - b);
   return slots;
 }
@@ -160,7 +131,7 @@ function candidateSlots(target, now, { weekdaysOnly }) {
 async function loadBusyTimes(now) {
   const since = admin.firestore.Timestamp.fromDate(new Date(now.getTime() - SLOT_MS));
   const snap = await db().collection("appointments").where("scheduledAt", ">=", since).get();
-  const busy = new Map(); // doctorId -> [ms, ms, ...]
+  const busy = new Map();
   snap.docs.forEach((d) => {
     const data = d.data();
     if (!data.doctorId || !data.scheduledAt) return;
@@ -175,7 +146,6 @@ function isFree(busy, doctorId, startMs) {
   return !(busy.get(doctorId) || []).some((t) => Math.abs(t - startMs) < SLOT_MS);
 }
 
-// ---- Writing the appointment ---------------------------------------------
 function buildAppointment({ summary, priority, needsAmbulanceFlag, language, transcriptText, source, patientId, facility, doctor, when, extra }) {
   const fullName = `${summary.name || ""} ${summary.surname || ""}`.trim() || "Unknown caller";
   const symptoms = [summary.symptoms, summary.symptomDuration ? `(for ${summary.symptomDuration})` : null]
@@ -201,7 +171,7 @@ function buildAppointment({ summary, priority, needsAmbulanceFlag, language, tra
     transcript: transcriptText || "",
     aiPriority: priority || "STANDARD",
     humanPriority: null,
-    status: "AWAITING_REVIEW", // staff still confirm the AI's priority
+    status: "AWAITING_REVIEW",
     appointmentStatus: when ? "BOOKED" : "NEEDS_MANUAL_BOOKING",
     scheduledAt: when ? admin.firestore.Timestamp.fromDate(when) : null,
     scheduledLabel: when ? spokenDateTime(when) : null,
@@ -242,7 +212,6 @@ async function writeAppointment({ ref, data, facility, lockId }) {
   });
 }
 
-// ---- Spoken confirmations (English; translated + spoken by the call flow) --
 function confirmationText({ tier, facility, doctor, when, preferred }) {
   const where = facility ? facility.name : "the hospital";
   const who = doctor ? ` with ${doctor.name}` : "";
@@ -269,8 +238,6 @@ function confirmationText({ tier, facility, doctor, when, preferred }) {
   );
 }
 
-// ---- The main entry point -------------------------------------------------
-// Returns { appointmentId, booked, tier, facilityName, doctorName, scheduledAt, confirmationText }.
 async function bookAppointment({
   patientId,
   summary,
@@ -288,7 +255,7 @@ async function bookAppointment({
   const cities = [...new Set(facilities.map((f) => f.location).filter(Boolean))];
   const city = resolveCity(summary, cities);
   const inCity = city ? facilities.filter((f) => f.location === city) : [];
-  const poolFacilities = inCity.length ? inCity : facilities; // nothing matched: any hospital
+  const poolFacilities = inCity.length ? inCity : facilities;
 
   const doctorSnap = await db().collection("doctors").get();
   const allDoctors = doctorSnap.docs.map((d) => ({ id: d.id, ...d.data() })).filter((d) => d.active !== false);
@@ -299,18 +266,18 @@ async function bookAppointment({
   const common = { summary, priority, needsAmbulanceFlag, language, transcriptText, source, patientId };
   const busy = await loadBusyTimes(now);
 
-  let chosen = null; // { facility, doctor, when, lockId }
+  let chosen = null;
 
   if (tier === "EMERGENCY") {
     const raw = now.getTime() + EMERGENCY_LEAD_MINUTES * 60 * 1000;
-    const when = new Date(Math.ceil(raw / (5 * 60 * 1000)) * 5 * 60 * 1000); // round up to 5 min
+    const when = new Date(Math.ceil(raw / (5 * 60 * 1000)) * 5 * 60 * 1000);
     const local = doctorsIn(poolFacilities);
     const ordered = [
       ...local.filter((d) => /emergency/i.test(d.role || "")),
       ...local.filter((d) => !/emergency/i.test(d.role || ""))
     ];
     const free = ordered.find((d) => isFree(busy, d.id, when.getTime()));
-    // Emergencies are booked even if the doctor is busy - staff are alerted.
+
     const doctor = free || ordered[0] || null;
     chosen = {
       facility: doctor ? facilityOf(doctor) : poolFacilities[0] || null,
@@ -331,11 +298,11 @@ async function bookAppointment({
         const lockId = `${doctor.id}_${slot.getTime()}`;
         const data = buildAppointment({ ...common, facility, doctor, when: slot, extra: {} });
         try {
-          // eslint-disable-next-line no-await-in-loop
+
           await writeAppointment({ ref, data, facility, lockId });
           chosen = { facility, doctor, when: slot, written: true };
         } catch (err) {
-          if (err.code !== "SLOT_TAKEN") throw err; // someone else just took it - try the next one
+          if (err.code !== "SLOT_TAKEN") throw err;
         }
         if (chosen) break;
       }
@@ -348,7 +315,6 @@ async function bookAppointment({
     await writeAppointment({ ref, data, facility: chosen.facility, lockId: null });
   }
 
-  // Nothing free (or no doctors on file): still record the request so staff can phone the patient.
   if (!chosen) {
     const facility = poolFacilities[0] || null;
     const data = buildAppointment({ ...common, facility, doctor: null, when: null, extra: {} });
