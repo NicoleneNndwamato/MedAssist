@@ -37,4 +37,12 @@ function sayAndHangup(text) {
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Say>${escapeXml(text)}</Say><Hangup/></Response>`;
 }
 
-module.exports = { playAndRecord, playAndHangup, sayAndHangup };
+function sayAndRecord(text, { actionUrl, timeoutSeconds, maxLengthSeconds }) {
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?><Response><Say>${escapeXml(text)}</Say>` +
+    `<Record action="${escapeXml(actionUrl)}" method="POST" timeout="${timeoutSeconds}" ` +
+    `maxLength="${maxLengthSeconds}" playBeep="false" trim="trim-silence"/></Response>`
+  );
+}
+
+module.exports = { playAndRecord, playAndHangup, sayAndHangup, sayAndRecord };

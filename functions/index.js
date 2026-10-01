@@ -1,7 +1,7 @@
 const { onRequest } = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const fetch = require("node-fetch");
-const { playAndRecord, playAndHangup, sayAndHangup } = require("./services/voiceMarkup");
+const { playAndRecord, playAndHangup, sayAndHangup, sayAndRecord } = require("./services/voiceMarkup");
 
 admin.initializeApp({ storageBucket: "medassist-397be.firebasestorage.app" });
 
@@ -34,6 +34,33 @@ const RECORD_MAX_LENGTH_SECONDS = 45;
 
 // How many times we re-ask before giving up and ending the call politely.
 const MAX_REPROMPTS = 2;
+
+// SignalWire gives up on a webhook after roughly 15 seconds and silently
+// hangs up ("normal clearing" in its logs). Every turn does STT + translate +
+// LLM + TTS, so we (a) keep the instance warm, (b) run independent steps in
+// parallel, and (c) race the work against a deadline so the caller hears a
+// friendly "say that again" instead of dead air.
+const HOOK_OPTIONS = { timeoutSeconds: 60, memory: "512MiB", minInstances: 1 };
+const TURN_DEADLINE_MS = 12000;
+
+function makeTimer(label) {
+  const start = Date.now();
+  let last = start;
+  return (step) => {
+    const now = Date.now();
+    console.log(`[timing] ${label} | ${step}: +${now - last}ms (total ${now - start}ms)`);
+    last = now;
+  };
+}
+
+const DEADLINE = Symbol("deadline");
+function withDeadline(promise, ms) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(DEADLINE), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 const WELCOME_PROMPT = "Welcome to MedAssist. Please tell us your name to begin.";
 const EMPTY_RESPONSE_XML = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
@@ -169,7 +196,7 @@ async function repromptOrEnd(res, callSid, session, creds) {
 // Gemini-powered agent (services/medAssistAgent.js), not a fixed script.
 // ---------------------------------------------------------------------------
 
-exports.incomingCall = onRequest(async (req, res) => {
+exports.incomingCall = onRequest(HOOK_OPTIONS, async (req, res) => {
   try {
     const phoneNumber = req.body.From;
     const callSid = req.body.CallSid;
@@ -238,11 +265,12 @@ exports.incomingCall = onRequest(async (req, res) => {
   }
 });
 
-exports.handleRecording = onRequest(async (req, res) => {
-  try {
-    const callSid = req.body.CallSid;
-    const recordingUrl = req.body.RecordingUrl;
+exports.handleRecording = onRequest(HOOK_OPTIONS, async (req, res) => {
+  const callSid = req.body.CallSid;
+  const recordingUrl = req.body.RecordingUrl;
+  const tick = makeTimer(`handleRecording ${callSid}`);
 
+  try {
     if (!callSid) {
       console.error("handleRecording: no CallSid in callback. Body:", JSON.stringify(req.body));
       return respondWithApology(res);
@@ -257,106 +285,172 @@ exports.handleRecording = onRequest(async (req, res) => {
     if (!session) {
       throw new Error(`No session found for callSid ${callSid}`);
     }
+    tick("loaded session");
 
     const creds = azureCreds();
-    const groqApiKey = process.env.GROQ_API_KEY;
 
     if (!recordingUrl) {
       console.warn("handleRecording: callback had no RecordingUrl, re-asking. Body:", JSON.stringify(req.body));
       return await repromptOrEnd(res, callSid, session, creds);
     }
 
-    const audioBuffer = await fetchRecordingBuffer(recordingUrl);
+    // Do the whole turn, but never let it run past the deadline.
+    const outcome = await withDeadline(processTurn({ callSid, recordingUrl, session, creds, tick }), TURN_DEADLINE_MS);
 
-    let language = session.language;
-    let transcript;
-
-    if (session.awaitingLanguageDetection) {
-      const detected = await identifyLanguageAndTranscribe({
-        audioBuffer,
-        mimeType: "audio/wav",
-        speechKey: creds.speechKey,
-        speechRegion: creds.speechRegion
-      });
-      language = detected.locale;
-      transcript = detected.transcript;
-    } else {
-      const result = await transcribe({
-        audioBuffer,
-        mimeType: "audio/wav",
-        locale: language,
-        speechKey: creds.speechKey,
-        speechRegion: creds.speechRegion
-      });
-      transcript = result.transcript;
+    if (outcome === DEADLINE) {
+      console.error(`handleRecording: turn exceeded ${TURN_DEADLINE_MS}ms - asking caller to repeat.`);
+      return res.type("text/xml").send(
+        sayAndRecord("Sorry, that took too long. Please say that again.", {
+          actionUrl: functionUrl("handleRecording"),
+          timeoutSeconds: RECORD_SILENCE_TIMEOUT_SECONDS,
+          maxLengthSeconds: RECORD_MAX_LENGTH_SECONDS
+        })
+      );
     }
 
-    if (!transcript || !transcript.trim()) {
-      console.warn("handleRecording: recording transcribed to nothing, re-asking.");
-      return await repromptOrEnd(res, callSid, session, creds);
-    }
-
-    // Only lock in the caller's language once we actually understood something.
-    if (session.awaitingLanguageDetection) {
-      await createPatientIfMissing(session.phoneNumber);
-      await upsertPatientProfile(session.phoneNumber, { preferredLanguage: language });
-    }
-
-    const englishText = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
-    const savedClip = await saveAudioClip({
-      phoneNumber: session.phoneNumber,
-      questionId: `turn-${(session.transcript || []).length}`,
-      audioBuffer,
-      contentType: "audio/wav"
-    });
-
-    const agentTurn = await converse({
-      history: session.conversationHistory || [],
-      patientMessage: englishText,
-      knownProfile: session.summary,
-      topics: TOPICS,
-      apiKey: groqApiKey
-    });
-
-    const updatedTranscript = [
-      ...(session.transcript || []),
-      { role: "patient", local: transcript, english: englishText, audioUrl: savedClip.url },
-      { role: "medassist", english: agentTurn.reply, local: null }
-    ];
-
-    await updateSession(callSid, {
-      language,
-      awaitingLanguageDetection: false,
-      conversationHistory: agentTurn.history,
-      summary: agentTurn.summary,
-      transcript: updatedTranscript,
-      retries: 0
-    });
-
-    if (agentTurn.done) {
-      const profileUpdates = profileUpdatesFrom(agentTurn.summary);
-      if (Object.keys(profileUpdates).length) {
-        await upsertPatientProfile(session.phoneNumber, profileUpdates);
-      }
-
-      await addHistoryEntry(session.phoneNumber, {
-        language,
-        ...agentTurn.summary,
-        needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
-        transcript: updatedTranscript
-      });
-
-      const bye = await getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
-      return respondAndHangup(res, [bye.url]);
-    }
-
-    const replyAudio = await getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
-    return respondWithQuestion(res, [replyAudio.url]);
+    // outcome is { xml } produced by processTurn
+    tick("sending response");
+    return res.type("text/xml").send(outcome.xml);
   } catch (err) {
     console.error("handleRecording error:", err);
     return respondWithApology(res, err);
   }
 });
+
+// One full conversational turn. Returns { xml } (never touches `res`, so it
+// can be raced against the deadline safely).
+async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
+  const groqApiKey = process.env.GROQ_API_KEY;
+
+  const audioBuffer = await fetchRecordingBuffer(recordingUrl);
+  tick("downloaded recording");
+
+  // Start saving the caller's audio clip NOW, in parallel - nothing below
+  // needs to wait for it until we build the transcript.
+  const savedClipPromise = saveAudioClip({
+    phoneNumber: session.phoneNumber,
+    questionId: `turn-${(session.transcript || []).length}`,
+    audioBuffer,
+    contentType: "audio/wav"
+  }).catch((e) => {
+    console.error("saveAudioClip failed (non-fatal):", e);
+    return { url: null };
+  });
+
+  let language = session.language;
+  let transcript;
+
+  if (session.awaitingLanguageDetection) {
+    const detected = await identifyLanguageAndTranscribe({
+      audioBuffer,
+      mimeType: "audio/wav",
+      speechKey: creds.speechKey,
+      speechRegion: creds.speechRegion
+    });
+    language = detected.locale;
+    transcript = detected.transcript;
+  } else {
+    const result = await transcribe({
+      audioBuffer,
+      mimeType: "audio/wav",
+      locale: language,
+      speechKey: creds.speechKey,
+      speechRegion: creds.speechRegion
+    });
+    transcript = result.transcript;
+  }
+  tick("speech-to-text");
+
+  if (!transcript || !transcript.trim()) {
+    console.warn("processTurn: recording transcribed to nothing, re-asking.");
+    // repromptOrEnd writes to `res`, so give it a tiny capture object.
+    return captureResponse((fakeRes) => repromptOrEnd(fakeRes, callSid, session, creds));
+  }
+
+  // Only lock in the caller's language once we actually understood something.
+  const languageSetup = session.awaitingLanguageDetection
+    ? createPatientIfMissing(session.phoneNumber).then(() =>
+      upsertPatientProfile(session.phoneNumber, { preferredLanguage: language })
+    )
+    : Promise.resolve();
+
+  const englishText = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
+  tick("translate to English");
+
+  const agentTurn = await converse({
+    history: session.conversationHistory || [],
+    patientMessage: englishText,
+    knownProfile: session.summary,
+    topics: TOPICS,
+    apiKey: groqApiKey
+  });
+  tick(`LLM (done=${agentTurn.done})`);
+
+  const [savedClip] = await Promise.all([savedClipPromise, languageSetup]);
+
+  const updatedTranscript = [
+    ...(session.transcript || []),
+    { role: "patient", local: transcript, english: englishText, audioUrl: savedClip.url },
+    { role: "medassist", english: agentTurn.reply, local: null }
+  ];
+
+  // Start TTS for the reply while we write to Firestore - they're independent.
+  const replyAudioPromise = getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
+
+  const sessionWrite = updateSession(callSid, {
+    language,
+    awaitingLanguageDetection: false,
+    conversationHistory: agentTurn.history,
+    summary: agentTurn.summary,
+    transcript: updatedTranscript,
+    retries: 0
+  });
+
+  // Save the permanent profile EVERY turn, not just at the end, so a dropped
+  // call never loses what the patient already told us.
+  const profileUpdates = profileUpdatesFrom(agentTurn.summary);
+  const profileWrite = Object.keys(profileUpdates).length
+    ? upsertPatientProfile(session.phoneNumber, profileUpdates)
+    : Promise.resolve();
+
+  const [replyAudio] = await Promise.all([replyAudioPromise, sessionWrite, profileWrite]);
+  tick("TTS + Firestore writes");
+
+  if (agentTurn.done) {
+    await addHistoryEntry(session.phoneNumber, {
+      language,
+      ...agentTurn.summary,
+      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+      transcript: updatedTranscript
+    });
+    return { xml: playAndHangup([replyAudio.url]) };
+  }
+
+  return {
+    xml: playAndRecord([replyAudio.url], {
+      actionUrl: functionUrl("handleRecording"),
+      timeoutSeconds: RECORD_SILENCE_TIMEOUT_SECONDS,
+      maxLengthSeconds: RECORD_MAX_LENGTH_SECONDS
+    })
+  };
+}
+
+// repromptOrEnd() was written to send on a response object; this lets
+// processTurn reuse it while still just returning the XML.
+async function captureResponse(fn) {
+  let xml = "";
+  const fakeRes = {
+    type() {
+      return this;
+    },
+    send(body) {
+      xml = body;
+      return this;
+    }
+  };
+  await fn(fakeRes);
+  return { xml };
+}
 
 // ---------------------------------------------------------------------------
 // Text-chat version of the exact same agent, for the patient website. No
@@ -371,7 +465,7 @@ function setCors(res) {
   res.set("Access-Control-Allow-Headers", "Content-Type");
 }
 
-exports.chatMessage = onRequest(async (req, res) => {
+exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
   setCors(res);
   if (req.method === "OPTIONS") {
     return res.status(204).send("");
