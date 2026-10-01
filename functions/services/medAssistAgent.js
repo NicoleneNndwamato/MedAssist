@@ -4,7 +4,7 @@ const fetch = require("node-fetch");
 // both the phone call flow (functions/index.js) and the website chat, so
 // there's exactly one "brain" behind both surfaces, not two copies that can
 // drift apart.
-function buildSystemPrompt(topics) {
+function buildSystemPrompt(topics, knownProfile) {
   const topicList = topics.map((t) => `- ${t}`).join("\n");
   return `You are MedAssist, a warm, calm healthcare intake assistant used by a hospital/clinic to gather information from a patient before they are seen by staff. You are NOT a doctor and must NEVER diagnose a condition, name a suspected illness, or suggest a treatment.
 
@@ -30,12 +30,44 @@ Rules:
   }
 }
 "summary" is your best current understanding of every field so far - fill in what you know, leave the rest null, and update it every turn, not just at the end.
-"done" becomes true once you have gathered enough to end the conversation (you don't need every field if it's a genuine emergency - prioritise safety guidance, location, and an emergency contact, then end quickly). When done is true, "reply" should be a short, kind closing message.`;
+"done" becomes true once you have gathered enough to end the conversation (you don't need every field if it's a genuine emergency - prioritise safety guidance, location, and an emergency contact, then end quickly). When done is true, "reply" should be a short, kind closing message.
+
+Known so far for this patient: ${JSON.stringify(knownProfile || {})}`;
+}
+
+// Groq's free tier (console.groq.com) - OpenAI-compatible API format, so
+// "history"/messages here are the standard { role: "system"|"user"|
+// "assistant", content: string } shape, not Gemini's role/parts shape.
+const GROQ_MODEL = "openai/gpt-oss-120b";
+
+// Groq's free tier is generous but not infinite - retry transient 429
+// (rate limited) or 503 (overloaded) responses a couple of times before
+// giving up, so a momentary blip doesn't end the patient's call/chat.
+async function fetchWithRetry(url, options, { attempts = 3, delaysMs = [600, 1800] } = {}) {
+  let lastErrText = "";
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    // eslint-disable-next-line no-await-in-loop
+    const response = await fetch(url, options);
+    if (response.ok) return response;
+
+    // eslint-disable-next-line no-await-in-loop
+    lastErrText = await response.text();
+    const retryable = response.status === 503 || response.status === 429;
+    if (retryable && attempt < attempts - 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt] || 1800));
+      continue;
+    }
+    throw new Error(`Groq API error (${response.status}): ${lastErrText}`);
+  }
+  throw new Error(`Groq API error after retries: ${lastErrText}`);
 }
 
 // One turn of the conversation.
-// - `history` is the Gemini-format running transcript so far:
-//   [{ role: "user"|"model", parts: [{ text }] }]
+// - `history` is the running chat transcript so far, OpenAI-message-shaped:
+//   [{ role: "user"|"assistant", content: string }] - no system message in
+//   here, that's added fresh each call so it can include the latest
+//   "Known so far" profile snapshot.
 // - `patientMessage` is the patient's latest message, ALWAYS in English
 //   (translated upstream if they spoke/typed another language) - the agent
 //   only ever thinks in English, translation happens outside this file.
@@ -44,30 +76,28 @@ Rules:
 // Returns { reply, done, needsAmbulanceFlag, summary, history } where
 // `history` is ready to pass back in as `history` on the next turn.
 async function converse({ history, patientMessage, knownProfile, topics, apiKey }) {
-  const contents = [...history, { role: "user", parts: [{ text: patientMessage }] }];
-  const systemInstructionText =
-    buildSystemPrompt(topics) + "\n\nKnown so far for this patient: " + JSON.stringify(knownProfile || {});
+  const messages = [
+    { role: "system", content: buildSystemPrompt(topics, knownProfile) },
+    ...history,
+    { role: "user", content: patientMessage }
+  ];
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstructionText }] },
-        contents,
-        generationConfig: { responseMimeType: "application/json", temperature: 0.4 }
-      })
-    }
-  );
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini API error: ${errText}`);
-  }
+  const response = await fetchWithRetry("https://api.groq.com/openai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages,
+      response_format: { type: "json_object" },
+      temperature: 0.4
+    })
+  });
 
   const data = await response.json();
-  const rawText = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
+  const rawText = data.choices?.[0]?.message?.content || "";
 
   let parsed;
   try {
@@ -78,12 +108,16 @@ async function converse({ history, patientMessage, knownProfile, topics, apiKey 
     parsed = { reply: "Sorry, could you say that again?", done: false, needsAmbulanceFlag: false, summary: knownProfile || {} };
   }
 
+  // history stored WITHOUT the system message - it's rebuilt fresh every
+  // turn above, so "Known so far" always reflects the latest summary.
+  const updatedHistory = [...history, { role: "user", content: patientMessage }, { role: "assistant", content: rawText }];
+
   return {
     reply: parsed.reply || "Sorry, could you say that again?",
     done: !!parsed.done,
     needsAmbulanceFlag: !!parsed.needsAmbulanceFlag,
     summary: parsed.summary || knownProfile || {},
-    history: [...contents, { role: "model", parts: [{ text: rawText }] }]
+    history: updatedHistory
   };
 }
 

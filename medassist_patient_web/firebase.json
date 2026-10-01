@@ -1,0 +1,8 @@
+{
+  "hosting": {
+    "site": "medassist-patient-web",
+    "public": "dist",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [{ "source": "**", "destination": "/index.html" }]
+  }
+}

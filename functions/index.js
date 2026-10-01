@@ -174,7 +174,7 @@ exports.incomingCall = onRequest(async (req, res) => {
     const phoneNumber = req.body.From;
     const callSid = req.body.CallSid;
     const creds = azureCreds();
-    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const groqApiKey = process.env.GROQ_API_KEY;
 
     if (!phoneNumber || !callSid) {
       return respondWithApology(res);
@@ -196,7 +196,7 @@ exports.incomingCall = onRequest(async (req, res) => {
         patientMessage: kickoff,
         knownProfile,
         topics: TOPICS,
-        apiKey: geminiApiKey
+        apiKey: groqApiKey
       });
 
       await createSession(callSid, {
@@ -259,7 +259,7 @@ exports.handleRecording = onRequest(async (req, res) => {
     }
 
     const creds = azureCreds();
-    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const groqApiKey = process.env.GROQ_API_KEY;
 
     if (!recordingUrl) {
       console.warn("handleRecording: callback had no RecordingUrl, re-asking. Body:", JSON.stringify(req.body));
@@ -315,7 +315,7 @@ exports.handleRecording = onRequest(async (req, res) => {
       patientMessage: englishText,
       knownProfile: session.summary,
       topics: TOPICS,
-      apiKey: geminiApiKey
+      apiKey: groqApiKey
     });
 
     const updatedTranscript = [
@@ -383,7 +383,7 @@ exports.chatMessage = onRequest(async (req, res) => {
       return res.status(400).json({ error: "sessionId is required" });
     }
 
-    const geminiApiKey = process.env.GEMINI_API_KEY;
+    const groqApiKey = process.env.GROQ_API_KEY;
     const creds = azureCreds();
     const session = await getSession(sessionId, "chatSessions");
 
@@ -401,7 +401,7 @@ exports.chatMessage = onRequest(async (req, res) => {
         patientMessage: "(Chat started. Greet the patient warmly and begin.)",
         knownProfile,
         topics: TOPICS,
-        apiKey: geminiApiKey
+        apiKey: groqApiKey
       });
 
       const translatedGreeting = await translateText({ text: agentTurn.reply, toLanguageCode: chosenLanguage, ...creds });
@@ -432,7 +432,7 @@ exports.chatMessage = onRequest(async (req, res) => {
       patientMessage: englishText,
       knownProfile: session.summary,
       topics: TOPICS,
-      apiKey: geminiApiKey
+      apiKey: groqApiKey
     });
 
     const translatedReply = await translateText({ text: agentTurn.reply, toLanguageCode: session.language, ...creds });
@@ -463,7 +463,12 @@ exports.chatMessage = onRequest(async (req, res) => {
       });
     }
 
-    return res.json({ reply: translatedReply, done: agentTurn.done });
+    return res.json({
+      reply: translatedReply,
+      done: agentTurn.done,
+      summary: agentTurn.summary,
+      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag
+    });
   } catch (err) {
     console.error("chatMessage error:", err);
     return res.status(500).json({ error: "Something went wrong. Please try again." });

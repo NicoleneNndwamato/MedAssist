@@ -1,28 +1,64 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { QUESTIONS_BY_LANGUAGE, UI_STRINGS } from '../data/questions';
+import { UI_STRINGS } from '../data/questions';
 import { submitCheckIn } from '../services/firestoreService';
 import { toast } from '../components/Toast';
 
+const CHAT_URL = 'https://chatmessage-pvyz6ypfha-uc.a.run.app';
+
+const LANGUAGE_CODES = { English: 'en-ZA', isiZulu: 'zu-ZA', Afrikaans: 'af-ZA' };
+
+const ERROR_TEXT = {
+  English: 'Sorry, something went wrong. Please try again.',
+  isiZulu: 'Uxolo, kube nenkinga. Sicela uzame futhi.',
+  Afrikaans: 'Jammer, iets het verkeerd gegaan. Probeer asseblief weer.',
+};
+
+async function callChat(body) {
+  const res = await fetch(CHAT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error('Chat request failed: ' + res.status);
+  return res.json();
+}
+
+function summaryToAnswers(summary, needsAmbulanceFlag) {
+  const s = summary || {};
+  return {
+    name: [s.name, s.surname].filter(Boolean).join(' '),
+    age: s.age || '',
+    location: s.location || '',
+    symptoms: s.symptoms || '',
+    duration: s.symptomDuration || '',
+    lastVisit: s.lastVisit || '',
+    pastHistory: s.medicalHistory || '',
+    medication: s.medications || '',
+    ambulance: needsAmbulanceFlag ? 'yes' : s.needsAmbulance || '',
+    emergencyContact: s.emergencyContactNumber || '',
+  };
+}
+
 export default function ChatPage({ patient, onSubmitted }) {
   const language = patient.language || 'English';
-  const questions = QUESTIONS_BY_LANGUAGE[language] || QUESTIONS_BY_LANGUAGE.English;
+  const languageCode = LANGUAGE_CODES[language] || 'en-ZA';
   const t = UI_STRINGS[language] || UI_STRINGS.English;
 
-  const [qIndex, setQIndex] = useState(0);
-  const [answers, setAnswers] = useState({});
   const [messages, setMessages] = useState([]);
   const [typing, setTyping] = useState(false);
   const [done, setDone] = useState(false);
   const [result, setResult] = useState(null);
+  const [answers, setAnswers] = useState({});
   const [input, setInput] = useState('');
+  const [turns, setTurns] = useState(0);
   const logRef = useRef(null);
-  const askedRef = useRef(false);
+  const startedRef = useRef(false);
+  const sessionIdRef = useRef(crypto.randomUUID());
 
   useEffect(() => {
-    if (!askedRef.current) {
-      askedRef.current = true;
-      askNext(0);
-    }
+    if (startedRef.current) return;
+    startedRef.current = true;
+    start();
     // eslint-disable-next-line
   }, []);
 
@@ -30,42 +66,62 @@ export default function ChatPage({ patient, onSubmitted }) {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [messages, typing, done]);
 
-  function askNext(index) {
+  async function start() {
     setTyping(true);
-    setTimeout(() => {
+    try {
+      const data = await callChat({
+        sessionId: sessionIdRef.current,
+        language: languageCode,
+        phoneNumber: patient.phone || undefined,
+      });
+      setMessages([{ who: 'bot', text: data.reply }]);
+    } catch (err) {
+      console.error(err);
+      setMessages([{ who: 'bot', text: ERROR_TEXT[language] || ERROR_TEXT.English }]);
+    } finally {
       setTyping(false);
-      setMessages(m => [...m, { who: 'bot', text: questions[index].text }]);
-    }, 450);
+    }
+  }
+
+  async function finish(data) {
+    const finalAnswers = summaryToAnswers(data.summary, data.needsAmbulanceFlag);
+    setAnswers(finalAnswers);
+    setDone(true);
+    try {
+      const saved = await submitCheckIn(patient, finalAnswers);
+      setResult(saved);
+      toast('Check-in sent to a healthcare worker');
+      if (onSubmitted) onSubmitted(saved);
+    } catch (err) {
+      console.error(err);
+      toast(ERROR_TEXT[language] || ERROR_TEXT.English);
+    }
   }
 
   async function handleSubmit() {
     const val = input.trim();
-    if (!val || done) return;
-    const q = questions[qIndex];
+    if (!val || done || typing) return;
     setMessages(m => [...m, { who: 'user', text: val }]);
-    const nextAnswers = { ...answers, [q.key]: val };
-    setAnswers(nextAnswers);
     setInput('');
-    const nextIndex = qIndex + 1;
-    setQIndex(nextIndex);
-
-    if (nextIndex >= questions.length) {
-      setTyping(true);
-      setTimeout(async () => {
-        setTyping(false);
-        setDone(true);
-        const saved = await submitCheckIn(patient, nextAnswers);
-        setResult(saved);
-        toast('Check-in sent to a healthcare worker');
-        if (onSubmitted) onSubmitted(saved);
-      }, 600);
-    } else {
-      askNext(nextIndex);
+    setTurns(n => n + 1);
+    setTyping(true);
+    try {
+      const data = await callChat({
+        sessionId: sessionIdRef.current,
+        language: languageCode,
+        message: val,
+      });
+      setMessages(m => [...m, { who: 'bot', text: data.reply }]);
+      if (data.done) await finish(data);
+    } catch (err) {
+      console.error(err);
+      setMessages(m => [...m, { who: 'bot', text: ERROR_TEXT[language] || ERROR_TEXT.English }]);
+    } finally {
+      setTyping(false);
     }
   }
 
-  const total = questions.length;
-  const pct = done ? 100 : Math.round((qIndex / total) * 100);
+  const pct = done ? 100 : Math.min(90, turns * 10);
 
   return (
     <div className="panel">
@@ -94,7 +150,7 @@ export default function ChatPage({ patient, onSubmitted }) {
             placeholder={done ? t.done : t.placeholder}
             disabled={done}
           />
-          <button className="sendbtn" onClick={handleSubmit} disabled={done}>{t.send}</button>
+          <button className="sendbtn" onClick={handleSubmit} disabled={done || typing}>{t.send}</button>
         </div>
       </div>
     </div>
