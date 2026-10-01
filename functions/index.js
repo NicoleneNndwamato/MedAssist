@@ -1,11 +1,10 @@
 const { onRequest } = require("firebase-functions/v2/https");
+const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
 const fetch = require("node-fetch");
 const { playAndRecord, playAndHangup, sayAndHangup, sayAndRecord } = require("./services/voiceMarkup");
 
 admin.initializeApp({ storageBucket: "medassist-397be.firebasestorage.app" });
-// Never crash a call because some optional field happens to be undefined.
-admin.firestore().settings({ ignoreUndefinedProperties: true });
 
 const { QUESTIONS } = require("./services/intakeQuestions");
 const { CANDIDATE_LANGUAGES } = require("./config/languages");
@@ -13,8 +12,7 @@ const { identifyLanguageAndTranscribe, transcribe } = require("./services/azureS
 const { translateToEnglish, translateText } = require("./services/azureTranslate");
 const { getSpokenAudioUrl } = require("./services/ttsCache");
 const { saveAudioClip } = require("./services/audioStorage");
-const { converse } = require("./services/medAssistAgent");
-const { bookAppointment, getCities } = require("./services/booking");
+const { converse, extractSummary, FIELD_QUESTIONS } = require("./services/medAssistAgent");
 const {
   getPatientByPhone,
   createPatientIfMissing,
@@ -29,29 +27,42 @@ const { createSession, getSession, updateSession } = require("./services/callSes
 // gets asked - QUESTIONS.text is written for exactly this purpose.
 const TOPICS = QUESTIONS.map((q) => q.text);
 
+const CALL_SESSIONS = "callSessions";
+
+// "name" is asked by the welcome prompt, so the phone questions start after it.
+// The ambulance question comes first so urgent cases are captured even if the
+// call is cut short.
+const PHONE_FIELDS = [
+  "needsAmbulance",
+  "surname",
+  "age",
+  "provider",
+  "location",
+  "symptoms",
+  "symptomDuration",
+  "lastVisit",
+  "medicalHistory",
+  "appointmentTime"
+];
+
+const CLOSING_PROMPT = "Thank you. We have everything we need. Goodbye.";
+
 // How long a pause tells SignalWire the caller is done talking - the
 // platform's own <Record> feature, no custom silence-detection code needed.
 // Also applies BEFORE the caller starts speaking, so give people a moment.
-const RECORD_SILENCE_TIMEOUT_SECONDS = 5;
+const RECORD_SILENCE_TIMEOUT_SECONDS = 2;
 const RECORD_MAX_LENGTH_SECONDS = 45;
 
 // How many times we re-ask before giving up and ending the call politely.
-const MAX_REPROMPTS = 2;
+const MAX_REPROMPTS =1;
 
 // SignalWire gives up on a webhook after roughly 15 seconds and silently
-// hangs up ("normal clearing" in its logs). Every turn does STT + translate +
-// LLM + TTS, so we (a) use enough memory/CPU, (b) run independent steps in
-// parallel, and (c) race the work against a deadline so the caller hears a
-// friendly "say that again" instead of dead air. (No minInstances: that costs money.)
+// hangs up ("normal clearing" in its logs). During the call a turn now only
+// stores the recording and plays the next question. Transcription,
+// translation, extraction and every database write happen in finalizeCall
+// once the call has ended.
 const HOOK_OPTIONS = { timeoutSeconds: 60, memory: "512MiB" };
 const TURN_DEADLINE_MS = 12000;
-
-// TEST SWITCH: set USE_SAY_REPLIES=true in functions/.env to have SignalWire
-// read the agent's reply with its own built-in voice (English only) instead
-// of our Azure TTS -> Cloud Storage -> <Play> pipeline. Much faster and has
-// far fewer moving parts. If calls work in this mode, the audio-file
-// pipeline is the problem.
-const USE_SAY_REPLIES = process.env.USE_SAY_REPLIES === "true";
 
 function makeTimer(label) {
   const start = Date.now();
@@ -84,26 +95,6 @@ function azureCreds() {
     translatorRegion: process.env.AZURE_TRANSLATOR_REGION,
     translatorEndpoint: process.env.AZURE_TRANSLATOR_ENDPOINT || "https://api.cognitive.microsofttranslator.com"
   };
-}
-
-// Builds the "already on file" profile for the agent: every field is a real
-// value or null - never undefined (Firestore rejects undefined).
-function knownProfileFrom(patient) {
-  const p = patient || {};
-  return {
-    name: p.name ?? null,
-    surname: p.surname ?? null,
-    age: p.age ?? null,
-    provider: p.provider ?? null
-  };
-}
-
-// Plain-text version of the conversation, stored on the appointment so staff
-// can read what the patient said.
-function transcriptToText(entries) {
-  return (entries || [])
-    .map((t) => `${t.role === "medassist" ? "MedAssist" : "Patient"}: ${t.english || t.local || ""}`)
-    .join("\n");
 }
 
 function functionUrl(name) {
@@ -183,8 +174,8 @@ function respondWithApology(res, err) {
 }
 
 // Used when SignalWire sends a callback with no recording (it heard
-// silence) or the recording transcribes to nothing. Re-asks (by replaying
-// the agent's own last message) up to MAX_REPROMPTS times, then ends the
+// silence) or the first recording transcribes to nothing. Re-asks (by
+// replaying the last question) up to MAX_REPROMPTS times, then ends the
 // call politely rather than hanging up on the first blip.
 async function repromptOrEnd(res, callSid, session, creds) {
   const retries = session.retries || 0;
@@ -201,7 +192,7 @@ async function repromptOrEnd(res, callSid, session, creds) {
     return res.type("text/xml").send(sayAndHangup("Sorry, we could not hear you. Please call again."));
   }
 
-  await updateSession(callSid, { retries: retries + 1 });
+  await updateSession(callSid, { retries: retries + 1 }, CALL_SESSIONS);
 
   if (session.awaitingLanguageDetection || !session.language) {
     const prompts = await Promise.all(
@@ -210,8 +201,7 @@ async function repromptOrEnd(res, callSid, session, creds) {
     return respondWithQuestion(res, prompts.map((p) => p.url));
   }
 
-  const lastMedassistTurn = [...(session.transcript || [])].reverse().find((t) => t.role === "medassist");
-  const lastReplyText = lastMedassistTurn ? lastMedassistTurn.english : "Could you tell us how you're feeling today?";
+  const lastReplyText = session.lastQuestion || "Could you tell us how you're feeling today?";
 
   const sorry = await getSpokenAudioUrl({ text: "Sorry, I did not catch that.", languageCode: session.language, creds });
   const repeat = await getSpokenAudioUrl({ text: lastReplyText, languageCode: session.language, creds });
@@ -220,10 +210,14 @@ async function repromptOrEnd(res, callSid, session, creds) {
 
 // ---------------------------------------------------------------------------
 // Multilingual phone intake, live on an actual phone number via SignalWire.
-// Two webhooks: SignalWire hits incomingCall the instant someone dials in,
-// then hits handleRecording every time a <Record> finishes. Every turn -
-// after the very first, language-detecting one - is driven by MedAssist's
-// Gemini-powered agent (services/medAssistAgent.js), not a fixed script.
+// Three stages:
+//   1. incomingCall - the caller dials in and hears the first question.
+//   2. handleRecording - every time a <Record> finishes, the recording URL is
+//      saved and the next question is played. Nothing else happens mid-call.
+//   3. finalizeCall - once the call is over (all questions answered, or the
+//      caller hung up / the call was cut), every recording is downloaded and
+//      stored, transcribed and translated, the answers are turned into a
+//      summary, and the patient table and history are updated in one go.
 // ---------------------------------------------------------------------------
 
 exports.incomingCall = onRequest(HOOK_OPTIONS, async (req, res) => {
@@ -231,57 +225,67 @@ exports.incomingCall = onRequest(HOOK_OPTIONS, async (req, res) => {
     const phoneNumber = req.body.From;
     const callSid = req.body.CallSid;
     const creds = azureCreds();
-    const groqApiKey = process.env.GROQ_API_KEY;
 
     if (!phoneNumber || !callSid) {
       return respondWithApology(res);
     }
 
     const existing = await getPatientByPhone(phoneNumber);
-    const knownProfile = knownProfileFrom(existing);
+    const knownProfile = existing
+      ? { name: existing.name, surname: existing.surname, age: existing.age, provider: existing.provider }
+      : {};
+    const questionKeys = PHONE_FIELDS.filter((field) => !knownProfile[field]);
 
     if (existing && existing.preferredLanguage) {
       const language = existing.preferredLanguage;
-      const kickoff = existing.name
-        ? `(Call started. The patient is ${existing.name}, calling again. Greet them warmly by name and begin.)`
-        : "(Call started. Greet the patient warmly and begin.)";
+      const [firstKey, ...remainingKeys] = questionKeys;
+      const firstQuestion = FIELD_QUESTIONS[firstKey];
+      const greeting = existing.name ? `Welcome back, ${existing.name}.` : "Welcome back to MedAssist.";
 
-      const agentTurn = await converse({
-        history: [],
-        patientMessage: kickoff,
-        knownProfile,
-        topics: TOPICS,
-        apiKey: groqApiKey,
-        cities: await getCities()
-      });
+      await createSession(
+        callSid,
+        {
+          phoneNumber,
+          language,
+          awaitingLanguageDetection: false,
+          status: "collecting",
+          currentKey: firstKey,
+          lastQuestion: firstQuestion,
+          questionKeys: remainingKeys,
+          answers: [],
+          summary: knownProfile,
+          retries: 0
+        },
+        CALL_SESSIONS
+      );
 
-      await createSession(callSid, {
-        phoneNumber,
-        language,
-        awaitingLanguageDetection: false,
-        conversationHistory: agentTurn.history,
-        summary: agentTurn.summary,
-        transcript: [{ role: "medassist", english: agentTurn.reply, local: null }],
-        retries: 0
-      });
-
-      const replyAudio = await getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
-      return respondWithQuestion(res, [replyAudio.url]);
+      const [greetingAudio, questionAudio] = await Promise.all([
+        getSpokenAudioUrl({ text: greeting, languageCode: language, creds }),
+        getSpokenAudioUrl({ text: firstQuestion, languageCode: language, creds })
+      ]);
+      return respondWithQuestion(res, [greetingAudio.url, questionAudio.url]);
     }
 
     // New caller, or we don't yet know their language - same "play the
     // welcome in every candidate language, whichever one they answer in
-    // tells us the language" trick as before. That first reply becomes the
-    // agent's first patient message once we've transcribed it.
-    await createSession(callSid, {
-      phoneNumber,
-      language: null,
-      awaitingLanguageDetection: true,
-      conversationHistory: [],
-      summary: knownProfile,
-      transcript: [],
-      retries: 0
-    });
+    // tells us the language" trick as before. That first reply is stored as
+    // the answer to "name".
+    await createSession(
+      callSid,
+      {
+        phoneNumber,
+        language: null,
+        awaitingLanguageDetection: true,
+        status: "collecting",
+        currentKey: "name",
+        lastQuestion: WELCOME_PROMPT,
+        questionKeys,
+        answers: [],
+        summary: knownProfile,
+        retries: 0
+      },
+      CALL_SESSIONS
+    );
 
     const prompts = await Promise.all(
       CANDIDATE_LANGUAGES.map((lang) => getSpokenAudioUrl({ text: WELCOME_PROMPT, languageCode: lang, creds }))
@@ -294,6 +298,19 @@ exports.incomingCall = onRequest(HOOK_OPTIONS, async (req, res) => {
   }
 });
 
+// The caller hung up (or the platform cut the call) while a <Record> was
+// open. Keep whatever was said and hand the session over to finalizeCall.
+async function closeCollection(callSid, recordingUrl) {
+  const session = await getSession(callSid, CALL_SESSIONS);
+  if (!session || session.status !== "collecting") return;
+
+  const answers = [...(session.answers || [])];
+  if (recordingUrl && session.currentKey) {
+    answers.push({ key: session.currentKey, question: session.lastQuestion, recordingUrl });
+  }
+  await updateSession(callSid, { answers, status: "collected" }, CALL_SESSIONS);
+}
+
 exports.handleRecording = onRequest(HOOK_OPTIONS, async (req, res) => {
   const callSid = req.body.CallSid;
   const recordingUrl = req.body.RecordingUrl;
@@ -305,12 +322,12 @@ exports.handleRecording = onRequest(HOOK_OPTIONS, async (req, res) => {
       return respondWithApology(res);
     }
 
-    // Caller already hung up and nothing was recorded: nobody to talk to.
-    if (!recordingUrl && req.body.CallStatus === "completed") {
+    if (req.body.CallStatus === "completed") {
+      await closeCollection(callSid, recordingUrl);
       return res.type("text/xml").send(EMPTY_RESPONSE_XML);
     }
 
-    const session = await getSession(callSid);
+    const session = await getSession(callSid, CALL_SESSIONS);
     if (!session) {
       throw new Error(`No session found for callSid ${callSid}`);
     }
@@ -346,167 +363,78 @@ exports.handleRecording = onRequest(HOOK_OPTIONS, async (req, res) => {
   }
 });
 
-// One full conversational turn. Returns { xml } (never touches `res`, so it
-// can be raced against the deadline safely).
+// One turn of the call. Returns { xml } (never touches `res`, so it can be
+// raced against the deadline safely). The only heavy step is the very first
+// turn of a new caller, which needs speech-to-text to detect the language.
 async function processTurn({ callSid, recordingUrl, session, creds, tick }) {
-  const groqApiKey = process.env.GROQ_API_KEY;
-
-  const audioBuffer = await fetchRecordingBuffer(recordingUrl);
-  tick("downloaded recording");
-
-  // Start saving the caller's audio clip NOW, in parallel - nothing below
-  // needs to wait for it until we build the transcript.
-  const savedClipPromise = saveAudioClip({
-    phoneNumber: session.phoneNumber,
-    questionId: `turn-${(session.transcript || []).length}`,
-    audioBuffer,
-    contentType: "audio/wav"
-  }).catch((e) => {
-    console.error("saveAudioClip failed (non-fatal):", e);
-    return { url: null };
-  });
-
   let language = session.language;
-  let transcript;
+  let firstTranscript = null;
 
   if (session.awaitingLanguageDetection) {
+    const audioBuffer = await fetchRecordingBuffer(recordingUrl);
+    tick("downloaded recording");
+
     const detected = await identifyLanguageAndTranscribe({
       audioBuffer,
       mimeType: "audio/wav",
       speechKey: creds.speechKey,
       speechRegion: creds.speechRegion
     });
+    tick("language detection");
+
+    if (!detected.transcript || !detected.transcript.trim()) {
+      console.warn("processTurn: recording transcribed to nothing, re-asking.");
+      return captureResponse((fakeRes) => repromptOrEnd(fakeRes, callSid, session, creds));
+    }
+
     language = detected.locale;
-    transcript = detected.transcript;
-  } else {
-    const result = await transcribe({
-      audioBuffer,
-      mimeType: "audio/wav",
-      locale: language,
-      speechKey: creds.speechKey,
-      speechRegion: creds.speechRegion
-    });
-    transcript = result.transcript;
-  }
-  tick("speech-to-text");
-
-  if (!transcript || !transcript.trim()) {
-    console.warn("processTurn: recording transcribed to nothing, re-asking.");
-    // repromptOrEnd writes to `res`, so give it a tiny capture object.
-    return captureResponse((fakeRes) => repromptOrEnd(fakeRes, callSid, session, creds));
+    firstTranscript = detected.transcript;
   }
 
-  // Only lock in the caller's language once we actually understood something.
-  const languageSetup = session.awaitingLanguageDetection
-    ? createPatientIfMissing(session.phoneNumber).then(() =>
-        upsertPatientProfile(session.phoneNumber, { preferredLanguage: language })
+  const answer = { key: session.currentKey, question: session.lastQuestion, recordingUrl };
+  if (firstTranscript) answer.transcript = firstTranscript;
+  const answers = [...(session.answers || []), answer];
+  const [nextKey, ...remainingKeys] = session.questionKeys || [];
+
+  if (!nextKey) {
+    const [closing] = await Promise.all([
+      getSpokenAudioUrl({ text: CLOSING_PROMPT, languageCode: language, creds }),
+      updateSession(
+        callSid,
+        { language, awaitingLanguageDetection: false, answers, status: "collected", retries: 0 },
+        CALL_SESSIONS
       )
-    : Promise.resolve();
+    ]);
+    tick("collected all answers");
+    return { xml: playAndHangup([closing.url]) };
+  }
 
-  const englishText = await translateToEnglish({ text: transcript, fromLanguageCode: language, ...creds });
-  tick("translate to English");
-
-  const agentTurn = await converse({
-    history: session.conversationHistory || [],
-    patientMessage: englishText,
-    knownProfile: session.summary,
-    topics: TOPICS,
-    apiKey: groqApiKey,
-        cities: await getCities()
-  });
-  tick(`LLM (done=${agentTurn.done})`);
-
-  // When the intake is complete, book the appointment in code (hospital,
-  // doctor and time chosen by urgency) and have the caller hear the result.
-  // `session.bookingConfirmation` guards against booking twice if SignalWire
-  // ever repeats a request.
-  let booking = null;
-  if (agentTurn.done) {
-    if (session.bookingConfirmation) {
-      agentTurn.reply = session.bookingConfirmation;
-    } else {
-      booking = await bookAppointment({
-        patientId: session.phoneNumber,
-        summary: agentTurn.summary,
-        needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
+  const nextQuestion = FIELD_QUESTIONS[nextKey];
+  const [questionAudio] = await Promise.all([
+    getSpokenAudioUrl({ text: nextQuestion, languageCode: language, creds }),
+    updateSession(
+      callSid,
+      {
         language,
-        transcriptText: transcriptToText([...(session.transcript || []), { role: "patient", english: englishText }]),
-        source: "phone"
-      });
-      agentTurn.reply = booking.confirmationText;
-      tick(`booked (${booking.tier}, booked=${booking.booked})`);
-    }
-  }
+        awaitingLanguageDetection: false,
+        answers,
+        currentKey: nextKey,
+        lastQuestion: nextQuestion,
+        questionKeys: remainingKeys,
+        retries: 0
+      },
+      CALL_SESSIONS
+    )
+  ]);
+  tick("stored answer, next question ready");
 
-  const [savedClip] = await Promise.all([savedClipPromise, languageSetup]);
-
-  const updatedTranscript = [
-    ...(session.transcript || []),
-    { role: "patient", local: transcript, english: englishText, audioUrl: savedClip.url },
-    { role: "medassist", english: agentTurn.reply, local: null }
-  ];
-
-  // Start TTS for the reply while we write to Firestore - they're independent.
-  const saySimple = USE_SAY_REPLIES && language === "en-ZA";
-  const replyAudioPromise = saySimple
-    ? Promise.resolve(null)
-    : getSpokenAudioUrl({ text: agentTurn.reply, languageCode: language, creds });
-
-  const sessionWrite = updateSession(callSid, {
-    language,
-    awaitingLanguageDetection: false,
-    conversationHistory: agentTurn.history,
-    summary: agentTurn.summary,
-    transcript: updatedTranscript,
-    retries: 0,
-    ...(booking ? { appointmentId: booking.appointmentId, bookingConfirmation: booking.confirmationText } : {})
-  });
-
-  // Save the permanent profile EVERY turn, not just at the end, so a dropped
-  // call never loses what the patient already told us.
-  const profileUpdates = profileUpdatesFrom(agentTurn.summary);
-  const profileWrite = Object.keys(profileUpdates).length
-    ? upsertPatientProfile(session.phoneNumber, profileUpdates)
-    : Promise.resolve();
-
-  const [replyAudio] = await Promise.all([replyAudioPromise, sessionWrite, profileWrite]);
-  tick("TTS + Firestore writes");
-
-  // Check, from our side, that the reply audio can actually be downloaded.
-  // (Range request, because the signed URL only allows GET, not HEAD.)
-  if (replyAudio) {
-    try {
-      const probe = await fetch(replyAudio.url, { headers: { Range: "bytes=0-1" } });
-      console.log(
-        `[audio-check] status=${probe.status} type=${probe.headers.get("content-type")} ` +
-          `range=${probe.headers.get("content-range")} len=${probe.headers.get("content-length")}`
-      );
-    } catch (probeErr) {
-      console.error("[audio-check] could not fetch reply audio:", probeErr.message);
-    }
-  }
-
-  if (agentTurn.done) {
-    await addHistoryEntry(session.phoneNumber, {
-      language,
-      ...agentTurn.summary,
-      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
-      appointmentId: booking ? booking.appointmentId : session.appointmentId || null,
-      transcript: updatedTranscript
-    });
-    const byeXml = replyAudio ? playAndHangup([replyAudio.url]) : sayAndHangup(agentTurn.reply);
-    console.log("[xml-out]", byeXml);
-    return { xml: byeXml };
-  }
-
-  const recordOpts = {
-    actionUrl: functionUrl("handleRecording"),
-    timeoutSeconds: RECORD_SILENCE_TIMEOUT_SECONDS,
-    maxLengthSeconds: RECORD_MAX_LENGTH_SECONDS
+  return {
+    xml: playAndRecord([questionAudio.url], {
+      actionUrl: functionUrl("handleRecording"),
+      timeoutSeconds: RECORD_SILENCE_TIMEOUT_SECONDS,
+      maxLengthSeconds: RECORD_MAX_LENGTH_SECONDS
+    })
   };
-  const xml = replyAudio ? playAndRecord([replyAudio.url], recordOpts) : sayAndRecord(agentTurn.reply, recordOpts);
-  console.log("[xml-out]", xml);
-  return { xml };
 }
 
 // repromptOrEnd() was written to send on a response object; this lets
@@ -525,6 +453,101 @@ async function captureResponse(fn) {
   await fn(fakeRes);
   return { xml };
 }
+
+// Runs after the call: this is where the audio is stored and the patient
+// table is updated.
+async function finalizeSession(callSid, session) {
+  const creds = azureCreds();
+  const language = session.language;
+  const answers = session.answers || [];
+
+  if (!language || !answers.length) {
+    await updateSession(callSid, { status: "abandoned" }, CALL_SESSIONS);
+    return;
+  }
+
+  const results = await Promise.all(
+    answers.map(async (answer, index) => {
+      try {
+        const audioBuffer = await fetchRecordingBuffer(answer.recordingUrl);
+
+        const [savedClip, local] = await Promise.all([
+          saveAudioClip({
+            phoneNumber: session.phoneNumber,
+            questionId: `${callSid}-${index}-${answer.key}`,
+            audioBuffer,
+            contentType: "audio/wav"
+          }).catch((e) => {
+            console.error("saveAudioClip failed (non-fatal):", e);
+            return { url: null };
+          }),
+          answer.transcript
+            ? Promise.resolve(answer.transcript)
+            : transcribe({
+                audioBuffer,
+                mimeType: "audio/wav",
+                locale: language,
+                speechKey: creds.speechKey,
+                speechRegion: creds.speechRegion
+              }).then((result) => result.transcript)
+        ]);
+
+        const english =
+          local && local.trim()
+            ? await translateToEnglish({ text: local, fromLanguageCode: language, ...creds })
+            : "";
+
+        return { key: answer.key, question: answer.question, local, english, audioUrl: savedClip.url };
+      } catch (err) {
+        console.error(`finalizeSession ${callSid}: answer ${answer.key} failed:`, err);
+        return { key: answer.key, question: answer.question, local: "", english: "", audioUrl: null };
+      }
+    })
+  );
+
+  const { summary, needsAmbulanceFlag } = await extractSummary({
+    answers: results,
+    knownProfile: session.summary,
+    apiKey: process.env.GROQ_API_KEY
+  });
+
+  const transcript = results.flatMap((r) => [
+    { role: "medassist", english: r.question, local: null },
+    { role: "patient", local: r.local, english: r.english, audioUrl: r.audioUrl }
+  ]);
+
+  await createPatientIfMissing(session.phoneNumber);
+  await upsertPatientProfile(session.phoneNumber, { ...profileUpdatesFrom(summary), preferredLanguage: language });
+  await addHistoryEntry(session.phoneNumber, {
+    language,
+    ...summary,
+    needsAmbulanceFlag,
+    transcript
+  });
+
+  await updateSession(callSid, { status: "processed", summary, transcript }, CALL_SESSIONS);
+}
+
+exports.finalizeCall = onDocumentUpdated(
+  { document: `${CALL_SESSIONS}/{callSid}`, timeoutSeconds: 300, memory: "512MiB" },
+  async (event) => {
+    const before = event.data.before.data();
+    const after = event.data.after.data();
+    if (!after || after.status !== "collected" || (before && before.status === "collected")) return;
+
+    const callSid = event.params.callSid;
+    try {
+      await finalizeSession(callSid, after);
+    } catch (err) {
+      console.error(`finalizeCall ${callSid} error:`, err);
+      await updateSession(
+        callSid,
+        { status: "failed", error: String((err && err.message) || err) },
+        CALL_SESSIONS
+      );
+    }
+  }
+);
 
 // ---------------------------------------------------------------------------
 // Text-chat version of the exact same agent, for the patient website. No
@@ -560,15 +583,16 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
     if (!session) {
       const chosenLanguage = language || "en-ZA";
       const existing = phoneNumber ? await getPatientByPhone(phoneNumber) : null;
-      const knownProfile = knownProfileFrom(existing);
+      const knownProfile = existing
+        ? { name: existing.name, surname: existing.surname, age: existing.age, provider: existing.provider }
+        : {};
 
       const agentTurn = await converse({
         history: [],
         patientMessage: "(Chat started. Greet the patient warmly and begin.)",
         knownProfile,
         topics: TOPICS,
-        apiKey: groqApiKey,
-        cities: await getCities()
+        apiKey: groqApiKey
       });
 
       const translatedGreeting = await translateText({ text: agentTurn.reply, toLanguageCode: chosenLanguage, ...creds });
@@ -599,26 +623,8 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
       patientMessage: englishText,
       knownProfile: session.summary,
       topics: TOPICS,
-      apiKey: groqApiKey,
-        cities: await getCities()
+      apiKey: groqApiKey
     });
-
-    let booking = null;
-    if (agentTurn.done) {
-      if (session.bookingConfirmation) {
-        agentTurn.reply = session.bookingConfirmation;
-      } else {
-        booking = await bookAppointment({
-          patientId: session.phoneNumber || `chat-${sessionId}`,
-          summary: agentTurn.summary,
-          needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
-          language: session.language,
-          transcriptText: transcriptToText([...(session.transcript || []), { role: "patient", english: englishText }]),
-          source: "chat"
-        });
-        agentTurn.reply = booking.confirmationText;
-      }
-    }
 
     const translatedReply = await translateText({ text: agentTurn.reply, toLanguageCode: session.language, ...creds });
 
@@ -630,12 +636,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
 
     await updateSession(
       sessionId,
-      {
-        conversationHistory: agentTurn.history,
-        summary: agentTurn.summary,
-        transcript: updatedTranscript,
-        ...(booking ? { appointmentId: booking.appointmentId, bookingConfirmation: booking.confirmationText } : {})
-      },
+      { conversationHistory: agentTurn.history, summary: agentTurn.summary, transcript: updatedTranscript },
       "chatSessions"
     );
 
@@ -649,7 +650,6 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
         language: session.language,
         ...agentTurn.summary,
         needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
-        appointmentId: booking ? booking.appointmentId : session.appointmentId || null,
         transcript: updatedTranscript
       });
     }
@@ -658,10 +658,7 @@ exports.chatMessage = onRequest({ timeoutSeconds: 60 }, async (req, res) => {
       reply: translatedReply,
       done: agentTurn.done,
       summary: agentTurn.summary,
-      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag,
-      appointment: booking
-        ? { id: booking.appointmentId, facility: booking.facilityName, doctor: booking.doctorName, when: booking.scheduledAt }
-        : null
+      needsAmbulanceFlag: agentTurn.needsAmbulanceFlag
     });
   } catch (err) {
     console.error("chatMessage error:", err);
